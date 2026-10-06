@@ -1,280 +1,220 @@
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-import scipy as sp
-import time
+#import os
+#import numpy as np
+#import matplotlib.pyplot as plt
+#import scipy as sp
+import sys
+#import time
 
-from scipy.interpolate     import CubicSpline
-from scipy.optimize        import minimize, Bounds, leastsq
-from scipy.optimize        import root_scalar  as rs
-from astropy.convolution   import convolve
-from sklearn.decomposition import NMF
-from astropy               import units        as u
-from astropy.coordinates   import SkyCoord
-from astropy.io            import fits, ascii
-from astropy.table         import QTable,Table
+#from scipy.interpolate     import CubicSpline
+#from scipy.optimize        import minimize, Bounds, leastsq
+#from scipy.optimize        import root_scalar  as rs
+#from astropy.convolution   import convolve
+#from sklearn.decomposition import NMF
+#from astropy               import units        as u
+#from astropy.coordinates   import SkyCoord
+#from astropy.io            import fits, ascii
+#from astropy.table         import QTable,Table
 #from tqdm                  import tqdm
 
-from doppler               import calcvel
-from doppler               import calcvelzz
-from doppler               import calcwave
-from atomic                import atomic
+#from atomic                import atomic
+#from doppler               import calcvel, calcvelzz, calcwave
+#from fitmodel              import fitmodel
 from sdsscat               import sdsscat
-from spectrum              import spectrum
-from fitmodel              import fitmodel
-from chisqfunc             import chisqfunc
+#from spectrum              import spectrum
+#from chisqfunc             import chisqfunc
+from readpars              import readpars
 
 # timeit to time a function
 # tqdm for a progress bar
 
 
-#  (1-4357.22/299792.458)*1210.761
-
-###############################################################################################
-
-def one_gaussian(x, params):
-    (c1, mu1, sigma1) = params
-    res =   c1 * np.exp( - (x - mu1)**2.0 / (2.0 * sigma1**2.0) )
-    return res
-
-def double_gaussian(x, params):
-    (c1, mu1, sigma1, c2, mu2, sigma2) = params
-    res =   c1 * np.exp( - (x - mu1)**2.0 / (2.0 * sigma1**2.0) ) + c2 * np.exp( - (x - mu2)**2.0 / (2.0 * sigma2**2.0) )
-    return res
-
-def dbl_gaussian_cnst(x, params):
-    (c1, mu1, sigma1, c2, mu2, sigma2, c3) = params
-    res =   c1 * np.exp( - (x - mu1)**2.0 / (2.0 * sigma1**2.0) ) + c2 * np.exp( - (x - mu2)**2.0 / (2.0 * sigma2**2.0) ) + c3
-    return res
-
-def double_gaussian_fit(params, x, y):
-    fit = double_gaussian(x, params)
-    return (fit - y)
-
-def dbl_gaussian_cnst_fit(params, x, y):
-    fit = dbl_gaussian_cnst(x, params)
-    return (fit - y)
-
-def diff_gaussian(x, params):
-    (c1, mu1, sigma1, c2, mu2, sigma2) = params
-    res =   c1 * np.exp( - (x - mu1)**2.0 / (2.0 * sigma1**2.0) ) - c2 * np.exp( - (x - mu2)**2.0 / (2.0 * sigma2**2.0) )
-    return res
-
-###############################################################################################
-
-rng = np.random.default_rng(12345)
-
-plt.ion()
-plt.clf()
-plt.pause(10)
-
-reset      = 1000
-
 ####################################################################
+breakstr = "#" * 50
+
+inputfile = "qanvaspar.txt"
+
+if len(sys.argv) > 1:
+    inputfile = sys.argv[1]
+
+print(breakstr)
+print(breakstr)
+print("Prepare to QANVAS Cosmic Noon!")
+print(breakstr)
+####################################################################
+mypars = readpars(inputfile)
 # Parameters and Program Flow
-print("Reading in parameters from ../../aalfitpar.txt ")
-with open('../../aalfitpar.txt', mode='r') as f:
-    R = float(((f.readline()).split())[0])       # Resolving power of spectra
-    dvres   = 299792.458/(2.35*R)                # Correspoding velocity resolution
-    dwres   = 1300.0/(2.35*R)                    # Corresponding wavelength resolution
-    nsamp   = int(((f.readline()).split())[0])   # Number of objects to read in
-    snrlim  = float(((f.readline()).split())[0]) # Lower limit on S/N
-    snrulim = float(((f.readline()).split())[0]) # Upper limit on S/N
-    minlox  = float(((f.readline()).split())[0]) # Minimum LOX for atomic species
-    nsigma  = float(((f.readline()).split())[0]) # Minimum absorption detection threshold
-    basedir = (f.readline().split())[0]          # Base directory
-    samplefile1 = (f.readline().split())[0]      # Sample file 1
-    samplefile0 = (f.readline().split())[0]      # Sample file 0
-    ncomp      = int(((f.readline()).split())[0])  # Number of NMF components
-    dwave      = float(((f.readline()).split())[0]) # Angstroms - sampling for NMF decomp
-    sigclip    = float(((f.readline()).split())[0])   # Sigma-clippig for NMF
-    compfile   = '../../nmf_components_'+str(ncomp)+'_SNR_'+str(snrlim)+'_sigma_'+str(sigclip)
-    box1       = int(((f.readline()).split())[0])
-    box2       = int(((f.readline()).split())[0])
-    nsmth      = int(((f.readline()).split())[0]) # Smoothing factor x (2803.5315 - 2796.3543)/self.dwave; Smoothing factor for determining initial Legendre order
-    donmf      = True
-    if (((f.readline()).split())[0] == 'False'): donmf     = False
-    dofit      = True
-    if (((f.readline()).split())[0] == 'False'): dofit     = False
-    absonly    = True
-    if (((f.readline()).split())[0] == 'False'): absonly   = False
-    dosearch   = True
-    if (((f.readline()).split())[0] == 'False'): dosearch  = False
-    specid   = True
-    if (((f.readline()).split())[0] == 'False'): specid  = False
-    firsttpcf  = True
-    if (((f.readline()).split())[0] == 'False'): firsttpcf = False
-    docluster  = True
-    if (((f.readline()).split())[0] == 'False'): docluster = False
-    verbose  = True
-    if (((f.readline()).split())[0] == 'False'): verbose   = False
-if verbose:
+
+
+if mypars.verbose:
+    print('---------------------------------------')
     print('Running with the following parameters:')
     print('---------------------------------------')
-    print('R = ', R, '(dvres = ',dvres,', dwres = ',dwres,')')
-    print('nsamp = ',nsamp)
-    print(snrlim, ' < S/N < ',snrulim)
-    print("min LOX = ",minlox)
-    print("n-sigma for detection = ",nsigma)
+#    print('R = ', R, '(dvres = ',dvres,', dwres = ',dwres,')')
+    print('nsamp = ',mypars.nsamp)
+#    print(snrlim, ' < S/N < ',snrulim)
+#    print("min LOX = ",minlox)
+#    print("n-sigma for detection = ",nsigma)
     print('---------------------------------------')
-    print('Base directory: ',basedir)
-    print('Sample file 1: ',basedir+'/'+samplefile1)
-    print('Sample file 0: ',basedir+'/'+samplefile0)
-    print('---------------------------------------')
-    print('NMF parameters...')
-    print('ncomp = ',ncomp)
-    print('dwave = ',dwave)
-    print('sigclip = ',sigclip)
-    print('compfile = ',compfile)
-    print('box1 = ',box1)
-    print('box2 = ',box2)
-    print('---------------------------------------')
-    print('Program Flow:')
-    print('donmf      = ', donmf)
-    print('dofit      = ', dofit)
-    print('absonly    = ', absonly)
-    print('dosearch   = ', dosearch)
-    print('specid     = ', specid)
-    print('firsttpcf  = ', firsttpcf)
-    print('docluster  = ', docluster)
-    print('verbose    = ', verbose)
+    print('Base directory: ',mypars.basedir)
+#    print('Sample file 1: ',mypars.basedir+'/'+samplefile1)
+#    print('Sample file 0: ',mypars.basedir+'/'+samplefile0)
+#    print('---------------------------------------')
+#    print('NMF parameters...')
+#    print('ncomp = ',ncomp)
+#    print('dwave = ',dwave)
+#    print('sigclip = ',sigclip)
+#   print('compfile = ',compfile)
+#    print('box1 = ',box1)
+#    print('box2 = ',box2)
+#    print('---------------------------------------')
+#   print('Program Flow:')
+#    print('donmf      = ', donmf)
+#    print('dofit      = ', dofit)
+#    print('absonly    = ', absonly)
+#    print('dosearch   = ', dosearch)
+#    print('specid     = ', specid)
+#    print('firsttpcf  = ', firsttpcf)
+#    print('docluster  = ', docluster)
+#    print('verbose    = ', verbose)
     print('---------------------------------------')
 
 
 ####################################################################
+sdss = sdsscat(mypars)
 
-t0 = time.time()
+
+#t0 = time.time()
 
 # Calling sequence:
-if False: #These things have already been done and can be by-passed. Keeping in case we want to rerun the entire analysis for a clean go
+#if False: #These things have already been done and can be by-passed. Keeping in case we want to rerun the entire analysis for a clean go
     #                                               readog, readfits, finddups
     # Read in the original list of observations, grab coordinates and redshifts from fits headers, and write samplefile0
-    sdss = sdsscat(basedir, samplefile0,     nsamp, readog=True, readfits=True,  finddups=False)
+#    sdss = sdsscat(basedir, samplefile0,     nsamp, readog=True, readfits=True,  finddups=False)
     # Read in samplefile0 and look for duplicates. Write samplefile0+"2" that has duplicates accounted.
-    sdss = sdsscat(basedir, samplefile0,     nsamp, readog=True, readfits=False, finddups=True)
+#    sdss = sdsscat(basedir, samplefile0,     nsamp, readog=True, readfits=False, finddups=True)
     # Read in samplefile0+"2".
-    sdss = sdsscat(basedir, samplefile0+"2", nsamp, readog=True, readfits=False, finddups=False)
+#    sdss = sdsscat(basedir, samplefile0+"2", nsamp, readog=True, readfits=False, finddups=False)
     # Generate combined ASCII spectra
-    sdss.mkasciispec(samplefile1)
+#    sdss.mkasciispec(samplefile1)
 
-sdss = sdsscat(basedir, samplefile1,      nsamp)
+#sdss = sdsscat(basedir, samplefile1,      nsamp)
 
-if verbose:
-    print("Finished reading catalog in "+str(time.time()-t0)+" seconds")
+#if verbose:
+#    print("Finished reading catalog in "+str(time.time()-t0)+" seconds")
 
-if False:
-    sdss.readspec(dwave,snrlim,R,clobberfits=True, clobbercomp=True)
-    sdss.readspec(dwave,snrlim,R,clobberfits=False,clobbercomp=True)
+#if False:
+#    sdss.readspec(dwave,snrlim,R,clobberfits=True, clobbercomp=True)
+#    sdss.readspec(dwave,snrlim,R,clobberfits=False,clobbercomp=True)
 
 # Note: 54002 unique objects
 
-if donmf:
-    sdss.readspec(dwave,snrlim,R)
-    sdx = np.extract(sdss.snr > snrlim, range(sdss.snr.size))
-    sdss.nmf(ncomp,sigclip,makeplot=True)
-    sdss.writecomp(compfile)
-    Wnew = np.zeros((sdss.qnum.size, ncomp))
-    wdx = np.extract(sdss.wavebins < calcwave(np.array([-5000]),np.array([1215.6701]))[0], range(sdss.wavebins.size))
-    fdx = np.extract(np.sum(sdss.fluxmat[:,wdx], axis=1) > 0, range(sdss.fluxmat.shape[0]))
-    Wnew[fdx,:] = np.copy(sdss.W)
-    sdss.W = np.copy(Wnew)
-    sdss.pltcomp(ncomp//2,2)
-    meanW = np.average(sdss.W[fdx,:], axis=0)
-    stdW  = np.std(    sdss.W[fdx,:], axis=0)
-    for (warray,prtstr) in [(meanW,f"<W> = "),(stdW,f"s_W= ")]:
-        for w in warray: prtstr += f" {w:.5f}"
-        print(prtstr)
-    input("Finished with NMF. Hit any key to end program.")
+#if donmf:
+#    sdss.readspec(dwave,snrlim,R)
+#    sdx = np.extract(sdss.snr > snrlim, range(sdss.snr.size))
+#    sdss.nmf(ncomp,sigclip,makeplot=True)
+#    sdss.writecomp(compfile)
+#    Wnew = np.zeros((sdss.qnum.size, ncomp))
+#    wdx = np.extract(sdss.wavebins < calcwave(np.array([-5000]),np.array([1215.6701]))[0], range(sdss.wavebins.size))
+#    fdx = np.extract(np.sum(sdss.fluxmat[:,wdx], axis=1) > 0, range(sdss.fluxmat.shape[0]))
+#    Wnew[fdx,:] = np.copy(sdss.W)
+#    sdss.W = np.copy(Wnew)
+#    sdss.pltcomp(ncomp//2,2)
+#    meanW = np.average(sdss.W[fdx,:], axis=0)
+#    stdW  = np.std(    sdss.W[fdx,:], axis=0)
+#    for (warray,prtstr) in [(meanW,f"<W> = "),(stdW,f"s_W= ")]:
+#        for w in warray: prtstr += f" {w:.5f}"
+#        print(prtstr)
+#    input("Finished with NMF. Hit any key to end program.")
 
-if docluster:
-    sdss.readspec(dwave,snrlim,R)
-    sdss.clustering()
+#if docluster:
+#    sdss.readspec(dwave,snrlim,R)
+#    sdss.clustering()
 
-if dofit or dosearch or specid:
-    t1 = time.time()
-    sdss.readcomp(compfile, ncomp)
-    if verbose: print("Finished reading NMF components in "+str(time.time()-t1)+" seconds")
-    uniqarray, udx = np.unique(sdss.qnum, return_index=True)
+#if dofit or dosearch or specid:
+#    t1 = time.time()
+#    sdss.readcomp(compfile, ncomp)
+#    if verbose: print("Finished reading NMF components in "+str(time.time()-t1)+" seconds")
+#    uniqarray, udx = np.unique(sdss.qnum, return_index=True)
 
-    if dosearch:
+#    if dosearch:
 
         # What is the NV1238 velocity corresponding to HI1215 @ -5000 km/s?
-        nvvelhiaal = np.fabs(calcvel(calcwave(np.array([-5000]),
-                                              np.array([1215.6701])),
-                                     np.array([1238.821])))[0]
+#        nvvelhiaal = np.fabs(calcvel(calcwave(np.array([-5000]),
+#                                              np.array([1215.6701])),
+#                                     np.array([1238.821])))[0]
 
-        sdss.readspec(dwave,snrlim,R)
+#        sdss.readspec(dwave,snrlim,R)
 
-        ncivq = 0
-        nnvq  = 0
-        nncq  = 0
-        nq    = 0
-        vrangeflag = 0
-        fpxflag    = 0
-        snrflag    = 0
-        nvcovflag  = 0
-        with open("aalsearch2.dat", "w") as f:
-            if verbose: print('dosearch - Looping through ',udx.size,' objects')
-            with open(basedir+"/searchlog", "w") as searchlog:
-                for q in np.extract(sdss.qnum[udx] > -1, udx):
-                    datfile = basedir+'/ASCII/' + sdss.fileroot[q] + '.dat'
-                    if (os.path.exists(datfile)) and (np.all(sdss.qnum[:q] != sdss.qnum[q])):
-                        if verbose: print('Reading in ',datfile) #,' and writing ',linfile)
-                        searchlog.write(('Reading in {}\n').format(datfile))
-                        myspec = spectrum(datfile,sdss.qnum[q],R)
-                        myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+sdss.zqso[q]))
-                        vvv = np.fabs(calcvel(myspec.wavelength,myatoms.wave[myatoms.getspecies(7,5)]))
-                        if (myspec.vrange >= nvvelhiaal) and (myspec.fpx.size > 0) and (sdss.snr[q] > snrlim) and (np.min(vvv) < 200):
-                            vdx,nnflux,nnferr,ew,sew,bigew,bigsew = myspec.normspec(sdss,box1,box2,makeplot=True)
+#        ncivq = 0
+#        nnvq  = 0
+#        nncq  = 0
+#        nq    = 0
+#        vrangeflag = 0
+#        fpxflag    = 0
+#        snrflag    = 0
+#        nvcovflag  = 0
+#        with open("aalsearch2.dat", "w") as f:
+#            if verbose: print('dosearch - Looping through ',udx.size,' objects')
+#            with open(basedir+"/searchlog", "w") as searchlog:
+#                for q in np.extract(sdss.qnum[udx] > -1, udx):
+#                    datfile = basedir+'/ASCII/' + sdss.fileroot[q] + '.dat'
+#                    if (os.path.exists(datfile)) and (np.all(sdss.qnum[:q] != sdss.qnum[q])):
+#                        if verbose: print('Reading in ',datfile) #,' and writing ',linfile)
+#                        searchlog.write(('Reading in {}\n').format(datfile))
+#                        myspec = spectrum(datfile,sdss.qnum[q],R)
+#                        myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+sdss.zqso[q]))
+#                        vvv = np.fabs(calcvel(myspec.wavelength,myatoms.wave[myatoms.getspecies(7,5)]))
+#                        if (myspec.vrange >= nvvelhiaal) and (myspec.fpx.size > 0) and (sdss.snr[q] > snrlim) and (np.min(vvv) < 200):
+#                            vdx,nnflux,nnferr,ew,sew,bigew,bigsew = myspec.normspec(sdss,box1,box2,makeplot=True)
 
-                            nciva,nnva,nnvciva = myspec.dosearch(sdss,q,box1,box2,verbose,myatoms,basedir,makeplot=True)
+#                            nciva,nnva,nnvciva = myspec.dosearch(sdss,q,box1,box2,verbose,myatoms,basedir,makeplot=True)
 
-                            nq += 1
-                            if nciva   > 0: ncivq += 1
-                            if nnva    > 0: nnvq  += 1
-                            if nnvciva > 0: nncq  += 1
+#                            nq += 1
+#                            if nciva   > 0: ncivq += 1
+#                            if nnva    > 0: nnvq  += 1
+#                            if nnvciva > 0: nncq  += 1
 
-                            print(f"{sdss.qnum[q]:5d} {nciva:3d} {nnva:3d} {nnvciva:3d} {nq:5d} {ncivq/nq:5.3f} {nnvq/nq:5.3f} {nncq/nq:5.3f}")
-                            f.write(f"{sdss.qnum[q]:5d} {nciva:3d} {nnva:3d} {nnvciva:3d}\n")
-                            searchlog.write(f"{sdss.qnum[q]:5d} {nciva:3d} {nnva:3d} {nnvciva:3d}\n")
-                            plt.pause(5)
-                            input("Inspect dosearch's work and then hit any key to continue...")
-                            
-                        else:
-                            dumstr = ""
-                            printit = False
-                            if (myspec.vrange < nvvelhiaal):
-                                vrangeflag += 1
-                                dumstr += f"            myspec.vrange = {myspec.vrange}"
-                                printit = True
-                            if myspec.fpx.size <= 0:
-                                fpxflag += 1
-                                dumstr += f"            myspec.fpx.size = {myspec.fpx.size}"
-                                printit = True
-                            if (sdss.snr[q] <= snrlim):
-                                dumstr += f"            sdss.snr[{q}] = {sdss.snr[q]}"
-                                snrflag += 1
-                                printit = True
-                            if vvv.size > 0:
-                                if (np.min(vvv) >= 200):
-                                    dumstr += f"            Closest pixel to N V = {np.min(np.fabs(calcvel(myspec.wavelength,myatoms.wave[myatoms.getspecies(7,5)])))}"
-                                    printit = True
-                            else:
-                                dumstr += "            N V not covered"
-                                printit = True
-                                nvcovflag += 1
-                            if printit:
-                                print(dumstr)
-                                print(f"            vrangeflag {vrangeflag} fpxflag {fpxflag} snrflag {snrflag} nvcovflag {nvcovflag}")
-                                searchlog.write(f"            vrangeflag {vrangeflag} fpxflag {fpxflag} snrflag {snrflag} nvcovflag {nvcovflag}\n")
+#                            print(f"{sdss.qnum[q]:5d} {nciva:3d} {nnva:3d} {nnvciva:3d} {nq:5d} {ncivq/nq:5.3f} {nnvq/nq:5.3f} {nncq/nq:5.3f}")
+#                            f.write(f"{sdss.qnum[q]:5d} {nciva:3d} {nnva:3d} {nnvciva:3d}\n")
+#                            searchlog.write(f"{sdss.qnum[q]:5d} {nciva:3d} {nnva:3d} {nnvciva:3d}\n")
+#                            plt.pause(5)
+#                            input("Inspect dosearch's work and then hit any key to continue...")
 
-                    else:
-                        if (os.path.exists(datfile) == False):
-                            print(f"{datfile} does not exist")
-                            searchlog.write(f"{datfile} does not exist\n")
-                        else:
-                            print(f"qnum = {sdss.qnum[q]} repeat offender")
-                            searchlog.write(f"qnum = {sdss.qnum[q]} repeat offender\n")
+#                        else:
+#                            dumstr = ""
+#                            printit = False
+#                            if (myspec.vrange < nvvelhiaal):
+#                                vrangeflag += 1
+#                                dumstr += f"            myspec.vrange = {myspec.vrange}"
+#                                printit = True
+#                            if myspec.fpx.size <= 0:
+#                                fpxflag += 1
+#                                dumstr += f"            myspec.fpx.size = {myspec.fpx.size}"
+#                                printit = True
+#                            if (sdss.snr[q] <= snrlim):
+#                                dumstr += f"            sdss.snr[{q}] = {sdss.snr[q]}"
+#                                snrflag += 1
+#                                printit = True
+#                            if vvv.size > 0:
+#                                if (np.min(vvv) >= 200):
+#                                    dumstr += f"            Closest pixel to N V = {np.min(np.fabs(calcvel(myspec.wavelength,myatoms.wave[myatoms.getspecies(7,5)])))}"
+#                                    printit = True
+#                            else:
+#                                dumstr += "            N V not covered"
+#                                printit = True
+#                                nvcovflag += 1
+#                            if printit:
+#                                print(dumstr)
+#                                print(f"            vrangeflag {vrangeflag} fpxflag {fpxflag} snrflag {snrflag} nvcovflag {nvcovflag}")
+#                                searchlog.write(f"            vrangeflag {vrangeflag} fpxflag {fpxflag} snrflag {snrflag} nvcovflag {nvcovflag}\n")
+
+#                    else:
+#                        if (os.path.exists(datfile) == False):
+#                            print(f"{datfile} does not exist")
+#                            searchlog.write(f"{datfile} does not exist\n")
+#                        else:
+#                            print(f"qnum = {sdss.qnum[q]} repeat offender")
+#                            searchlog.write(f"qnum = {sdss.qnum[q]} repeat offender\n")
                             
 
 
@@ -338,244 +278,245 @@ if dofit or dosearch or specid:
 
 ##                    break
 
-    if specid: # dosearch should happen first so that an aalsearch2.dat file exists.
-        qstart  = -1
-        data    = ascii.read("aalsearch2.dat", format="no_header")
-        qnum    = np.extract(data['col1'] > qstart, data['col1'])
-        civsys  = np.extract(data['col1'] > qstart, data['col2'])
-        vabs    = np.empty([])
-        vlo     = np.empty([])
-        vhi     = np.empty([])
-        bepm    = np.empty([])
-        beps    = np.empty([])
-        nvbew   = np.empty([])
-        nvbsew  = np.empty([])
-        nvrew   = np.empty([])
-        nvrsew  = np.empty([])
-        hiew    = np.empty([])
-        hisew   = np.empty([])
-        civbew  = np.empty([])
-        civbsew = np.empty([])
-        civrew  = np.empty([])
-        civrsew = np.empty([])
-        mgiibew  = np.empty([])
-        mgiibsew = np.empty([])
-        mgiirew  = np.empty([])
-        mgiirsew = np.empty([])
-        vranges = np.empty([])
-        qnum2   = np.empty([], dtype=np.int32)
-        nq = 0
-        nnq = 0
-        if (True): # Loop through all quasars
-            qcounter = 1000
-            lgratlo = 30
-            lgrathi = -30
-            oldddd = -1
-            for q in udx:
-                qdx = np.extract(qnum == sdss.qnum[q], qnum)
-                if qdx.size > 0:
-                    nq += 1
-                cdx = np.extract(qnum == sdss.qnum[q], civsys)
-                if cdx.size > 0:
-                    if cdx[0] > 0:
-                        datfile  = basedir+'/ASCII/' + sdss.fileroot[q] + '.dat'
-                        vabsfile = basedir+'/Vabs/'  + sdss.fileroot[q] + '.vabs'
-                        if (os.path.exists(datfile)) and (np.all(sdss.qnum[:q] != sdss.qnum[q])) and (False): # Do the absorber search on this object
-                            myspec = spectrum(datfile,sdss.qnum[q],R)
-                            if myspec.vrange > 299792.458:
-                                input("Pause for vrange check")
-                            myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+sdss.zqso[q]))
-                            vranges = np.append(vranges, -myspec.vrange)
-                            vranges = np.extract(np.fabs(vranges) < 299792.458, vranges) # Sanity check on the array
-                            if myspec.vrange > 10651: # This gives coverage to -5000 km/s for H I
-                                myspec.dosearch(sdss,q,box1,box2,verbose,myatoms,basedir)
-                        else:
-                            if (os.path.exists(datfile)) == False: print("missing datfile -- ",os.path.exists(datfile))
+"""
+#    if specid: # dosearch should happen first so that an aalsearch2.dat file exists.
+#        qstart  = -1
+#        data    = ascii.read("aalsearch2.dat", format="no_header")
+#        qnum    = np.extract(data['col1'] > qstart, data['col1'])
+#       civsys  = np.extract(data['col1'] > qstart, data['col2'])
+#        vabs    = np.empty([])
+#        vlo     = np.empty([])
+#       vhi     = np.empty([])
+#        bepm    = np.empty([])
+#        beps    = np.empty([])
+#        nvbew   = np.empty([])
+#        nvbsew  = np.empty([])
+#        nvrew   = np.empty([])
+#        nvrsew  = np.empty([])
+#        hiew    = np.empty([])
+#        hisew   = np.empty([])
+#        civbew  = np.empty([])
+#        civbsew = np.empty([])
+#        civrew  = np.empty([])
+#        civrsew = np.empty([])
+#        mgiibew  = np.empty([])
+#        mgiibsew = np.empty([])
+#        mgiirew  = np.empty([])
+#        mgiirsew = np.empty([])
+#        vranges = np.empty([])
+#        qnum2   = np.empty([], dtype=np.int32)
+#        nq = 0
+#        nnq = 0
+#        if (True): # Loop through all quasars
+#            qcounter = 1000
+#            lgratlo = 30
+#            lgrathi = -30
+#            oldddd = -1
+#            for q in udx:
+#                qdx = np.extract(qnum == sdss.qnum[q], qnum)
+#                if qdx.size > 0:
+#                    nq += 1
+#                cdx = np.extract(qnum == sdss.qnum[q], civsys)
+#                if cdx.size > 0:
+#                    if cdx[0] > 0:
+#                        datfile  = basedir+'/ASCII/' + sdss.fileroot[q] + '.dat'
+#                        vabsfile = basedir+'/Vabs/'  + sdss.fileroot[q] + '.vabs'
+#                        if (os.path.exists(datfile)) and (np.all(sdss.qnum[:q] != sdss.qnum[q])) and (False): # Do the absorber search on this object
+#                            myspec = spectrum(datfile,sdss.qnum[q],R)
+#                            if myspec.vrange > 299792.458:
+#                                input("Pause for vrange check")
+#                            myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+sdss.zqso[q]))
+#                            vranges = np.append(vranges, -myspec.vrange)
+#                            vranges = np.extract(np.fabs(vranges) < 299792.458, vranges) # Sanity check on the array
+#                            if myspec.vrange > 10651: # This gives coverage to -5000 km/s for H I
+#                                myspec.dosearch(sdss,q,box1,box2,verbose,myatoms,basedir)
+#                        else:
+#                            if (os.path.exists(datfile)) == False: print("missing datfile -- ",os.path.exists(datfile))
 
-                        if (os.path.exists(vabsfile)) and (True): # Compile all of the absorbers from all objects
-                            nnq += 1
-                            data    = ascii.read(vabsfile,format="no_header")
-                            vabs    = np.append(vabs,    data['col1'])
-                            vlo     = np.append(vlo,     data['col2'])
-                            vhi     = np.append(vhi,     data['col3'])
-                            bepm    = np.append(bepm,    data['col4'])
-                            beps    = np.append(beps,    data['col5'])
-                            nvbew   = np.append(nvbew,   data['col7'])
-                            nvbsew  = np.append(nvbsew,  data['col8'])
-                            nvrew   = np.append(nvrew,   data['col9'])
-                            nvrsew  = np.append(nvrsew,  data['col10'])
-                            hiew    = np.append(hiew,    data['col11'])
-                            hisew   = np.append(hisew,   data['col12'])
-                            civbew  = np.append(civbew,  data['col13'])
-                            civbsew = np.append(civbsew, data['col14'])
-                            civrew  = np.append(civrew,  data['col15'])
-                            civrsew = np.append(civrsew, data['col16'])
-                            mgiibew  = np.append(mgiibew,  data['col17'])
-                            mgiibsew = np.append(mgiibsew, data['col18'])
-                            mgiirew  = np.append(mgiirew,  data['col19'])
-                            mgiirsew = np.append(mgiirsew, data['col20'])
-                            qnum2   = np.append(qnum2,   np.broadcast_to(sdss.qnum[q],(len(data))))
+#                        if (os.path.exists(vabsfile)) and (True): # Compile all of the absorbers from all objects
+#                            nnq += 1
+#                            data    = ascii.read(vabsfile,format="no_header")
+#                            vabs    = np.append(vabs,    data['col1'])
+#                            vlo     = np.append(vlo,     data['col2'])
+#                            vhi     = np.append(vhi,     data['col3'])
+#                            bepm    = np.append(bepm,    data['col4'])
+#                            beps    = np.append(beps,    data['col5'])
+#                            nvbew   = np.append(nvbew,   data['col7'])
+#                            nvbsew  = np.append(nvbsew,  data['col8'])
+#                            nvrew   = np.append(nvrew,   data['col9'])
+#                            nvrsew  = np.append(nvrsew,  data['col10'])
+#                            hiew    = np.append(hiew,    data['col11'])
+#                            hisew   = np.append(hisew,   data['col12'])
+#                            civbew  = np.append(civbew,  data['col13'])
+#                            civbsew = np.append(civbsew, data['col14'])
+#                            civrew  = np.append(civrew,  data['col15'])
+#                            civrsew = np.append(civrsew, data['col16'])
+#                            mgiibew  = np.append(mgiibew,  data['col17'])
+#                            mgiibsew = np.append(mgiibsew, data['col18'])
+#                            mgiirew  = np.append(mgiirew,  data['col19'])
+#                            mgiirsew = np.append(mgiirsew, data['col20'])
+#                            qnum2   = np.append(qnum2,   np.broadcast_to(sdss.qnum[q],(len(data))))
 
-                            myspec = spectrum(datfile,sdss.qnum[q],R)
-                            myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+sdss.zqso[q]))
-                            vranges = np.append(vranges, -myspec.vrange)
+#                            myspec = spectrum(datfile,sdss.qnum[q],R)
+#                            myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+sdss.zqso[q]))
+#                            vranges = np.append(vranges, -myspec.vrange)
 
-                            cdx = np.extract((civbew > civbsew) & (vabs > -10651) & (nvbew > nvbsew), range(civbew.size))
-                            rat = nvbew[cdx]/civbew[cdx]
-                            subvabs = vabs[cdx]
+#                            cdx = np.extract((civbew > civbsew) & (vabs > -10651) & (nvbew > nvbsew), range(civbew.size))
+#                            rat = nvbew[cdx]/civbew[cdx]
+#                            subvabs = vabs[cdx]
 
-                            if (False): # Examine the N V, C IV, and H I velocity-stacked profiles
-                                vref,sigvref = (1091.78998613, 242.20382901)
-                                dvos = np.fabs(subvabs-vref)/sigvref
-                                ddx  = np.extract(dvos < 1, cdx)
-                                if (ddx.size > 3) and (ddx.size > oldddd):
-                                    oldddd = ddx.size
-#                                    sdx = np.argsort(vabs[ddx])
-                                    print(ddx.size, qnum2[ddx])
-                                    plt.clf()
-                                    for i in range(ddx.size):
-                                        ddd = ddx[i]
-                                        fileroot = (np.extract(sdss.qnum == qnum2[ddd], sdss.fileroot))[0]
-                                        zqso     = (np.extract(sdss.qnum == qnum2[ddd],     sdss.zqso))[0]
-                                        datfile = basedir+'/ASCII/' + fileroot + '.dat' 
-                                        vabsfile = basedir+'/Vabs/'  + fileroot + '.vabs'
-                                        myspec = spectrum(datfile,qnum2[ddd],R)
-                                        myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+zqso))
+#                            if (False): # Examine the N V, C IV, and H I velocity-stacked profiles
+#                                vref,sigvref = (1091.78998613, 242.20382901)
+#                                dvos = np.fabs(subvabs-vref)/sigvref
+#                                ddx  = np.extract(dvos < 1, cdx)
+#                                if (ddx.size > 3) and (ddx.size > oldddd):
+#                                    oldddd = ddx.size
+##                                    sdx = np.argsort(vabs[ddx])
+#                                    print(ddx.size, qnum2[ddx])
+#                                    plt.clf()
+#                                    for i in range(ddx.size):
+#                                        ddd = ddx[i]
+#                                        fileroot = (np.extract(sdss.qnum == qnum2[ddd], sdss.fileroot))[0]
+#                                        zqso     = (np.extract(sdss.qnum == qnum2[ddd],     sdss.zqso))[0]
+#                                        datfile = basedir+'/ASCII/' + fileroot + '.dat' 
+#                                        vabsfile = basedir+'/Vabs/'  + fileroot + '.vabs'
+#                                        myspec = spectrum(datfile,qnum2[ddd],R)
+#                                        myatoms = atomic(myspec.wavelength[0],myspec.wavelength[-1]*(1+zqso))
 
-                                        if i >= 9 * (ddx.size//9):
-                                            s = 331 + (i % 9)
-                                            print(i, 9 * (i//9), s, qnum2[ddx[i]])
-                                            plt.subplot(s)
+#                                        if i >= 9 * (ddx.size//9):
+#                                            s = 331 + (i % 9)
+#                                            print(i, 9 * (i//9), s, qnum2[ddx[i]])
+#                                            plt.subplot(s)
 
-                                            hidx = myatoms.getspecies(1,1)
-                                            wlim = calcwave(np.array([np.min(vabs[ddx])-3000,np.max(vabs[ddx])+3000]),myatoms.wave[hidx[0]])
-                                            wdx = np.extract((myspec.wavelength > wlim[0]) & (myspec.wavelength < wlim[1]), range(myspec.wavelength.size))
-                                            v = calcvel(myspec.wavelength[wdx],myatoms.wave[hidx[0]])
-                                            v0 = vabs[ddd]
-                                            plt.step(v,myspec.flux[wdx]/np.max(myspec.flux[wdx]), "g")
+#                                            hidx = myatoms.getspecies(1,1)
+#                                            wlim = calcwave(np.array([np.min(vabs[ddx])-3000,np.max(vabs[ddx])+3000]),myatoms.wave[hidx[0]])
+#                                            wdx = np.extract((myspec.wavelength > wlim[0]) & (myspec.wavelength < wlim[1]), range(myspec.wavelength.size))
+#                                            v = calcvel(myspec.wavelength[wdx],myatoms.wave[hidx[0]])
+#                                            v0 = vabs[ddd]
+#                                            plt.step(v,myspec.flux[wdx]/np.max(myspec.flux[wdx]), "g")
 
 
-                                            civdx = myatoms.getspecies(6,4)
-                                            wlim = calcwave(np.array([np.min(vabs[ddx])-3000,np.max(vabs[ddx])+3000]),myatoms.wave[civdx[0]])
-                                            wdx = np.extract((myspec.wavelength > wlim[0]) & (myspec.wavelength < wlim[1]), range(myspec.wavelength.size))
-                                            vb = calcvel(myspec.wavelength[wdx],myatoms.wave[civdx[0]])
-                                            vr = calcvel(myspec.wavelength[wdx],myatoms.wave[civdx[1]])
-                                            plt.step(vb,myspec.flux[wdx]/np.max(myspec.flux[wdx]) + 1, "b")
-                                            plt.step(vr,myspec.flux[wdx]/np.max(myspec.flux[wdx] )+ 1, "r--")
+#                                            civdx = myatoms.getspecies(6,4)
+#                                            wlim = calcwave(np.array([np.min(vabs[ddx])-3000,np.max(vabs[ddx])+3000]),myatoms.wave[civdx[0]])
+#                                            wdx = np.extract((myspec.wavelength > wlim[0]) & (myspec.wavelength < wlim[1]), range(myspec.wavelength.size))
+#                                            vb = calcvel(myspec.wavelength[wdx],myatoms.wave[civdx[0]])
+#                                            vr = calcvel(myspec.wavelength[wdx],myatoms.wave[civdx[1]])
+#                                            plt.step(vb,myspec.flux[wdx]/np.max(myspec.flux[wdx]) + 1, "b")
+#                                            plt.step(vr,myspec.flux[wdx]/np.max(myspec.flux[wdx] )+ 1, "r--")
 
-                                            nvdx = myatoms.getspecies(7,5)
-                                            wlim = calcwave(np.array([np.min(vabs[ddx])-3000,np.max(vabs[ddx])+3000]),myatoms.wave[nvdx[0]])
-                                            wdx = np.extract((myspec.wavelength > wlim[0]) & (myspec.wavelength < wlim[1]), range(myspec.wavelength.size))
-                                            vb = calcvel(myspec.wavelength[wdx],myatoms.wave[nvdx[0]])
-                                            vr = calcvel(myspec.wavelength[wdx],myatoms.wave[nvdx[1]])
-                                            plt.step(vb,myspec.flux[wdx]/np.max(myspec.flux[wdx]) + 2, "b")
-                                            plt.step(vr,myspec.flux[wdx]/np.max(myspec.flux[wdx]) + 2, "r--")
+#                                            nvdx = myatoms.getspecies(7,5)
+#                                            wlim = calcwave(np.array([np.min(vabs[ddx])-3000,np.max(vabs[ddx])+3000]),myatoms.wave[nvdx[0]])
+#                                            wdx = np.extract((myspec.wavelength > wlim[0]) & (myspec.wavelength < wlim[1]), range(myspec.wavelength.size))
+#                                            vb = calcvel(myspec.wavelength[wdx],myatoms.wave[nvdx[0]])
+#                                            vr = calcvel(myspec.wavelength[wdx],myatoms.wave[nvdx[1]])
+#                                            plt.step(vb,myspec.flux[wdx]/np.max(myspec.flux[wdx]) + 2, "b")
+#                                            plt.step(vr,myspec.flux[wdx]/np.max(myspec.flux[wdx]) + 2, "r--")
 
-                                            (ylo,yhi) = plt.ylim()
-                                            (xlo,xhi) = plt.xlim()
-                                            plt.plot([v0,v0],[ylo,yhi], "r")
-                                            plt.text(xlo + 0.1 * (xhi-xlo),ylo + 0.1 * (yhi-ylo),("qnum {}").format(qnum2[ddx[i]]))
+#                                            (ylo,yhi) = plt.ylim()
+#                                            (xlo,xhi) = plt.xlim()
+#                                            plt.plot([v0,v0],[ylo,yhi], "r")
+#                                            plt.text(xlo + 0.1 * (xhi-xlo),ylo + 0.1 * (yhi-ylo),("qnum {}").format(qnum2[ddx[i]]))
 
-                                    plt.pause(0.001)
+#                                    plt.pause(0.001)
 
-                            if (cdx.size > 5) and (True): # Analyze the N V 1238/C IV 1548 equivalent width ratio and vabs distribution
-                                rat   = nvbew[cdx]/civbew[cdx]
-                                lgrat = np.log10(rat+1.0e-7)
-                                if np.max(lgrat) > 8:
-                                    input("Paused for examination of lgrat")
-                                vsort = np.sort(vranges)
-                                vsort = np.extract(vsort < 299792.458, vsort)
-                                if np.max(np.fabs(vsort) > 299792.458):
-                                    input("Paused for vsort check")
-                                if np.min(lgrat) < lgratlo:
-                                    lgratlo = np.min(lgrat)
-                                    qqq = np.squeeze(np.extract(lgrat == lgratlo, cdx))
-                                    ldx = -1
-                                    if qqq.size > 1:
-                                        ldx = qqq[0]
-                                    elif qqq.size == 1:
-                                        ldx = qqq
-                                    ldx = np.squeeze(ldx)
-                                if ldx >= 0:
-                                    if np.max(lgrat) > lgrathi:
-                                        lgrathi = np.max(lgrat)
-                                        ldx = np.extract(lgrat == lgrathi, cdx)
-                                    if (True):
-                                        counts, bins = np.histogram(lgrat, bins=30)
-                                        if np.sum(counts) > 50:
+#                            if (cdx.size > 5) and (True): # Analyze the N V 1238/C IV 1548 equivalent width ratio and vabs distribution
+#                                rat   = nvbew[cdx]/civbew[cdx]
+#                                lgrat = np.log10(rat+1.0e-7)
+#                                if np.max(lgrat) > 8:
+#                                    input("Paused for examination of lgrat")
+#                                vsort = np.sort(vranges)
+#                                vsort = np.extract(vsort < 299792.458, vsort)
+#                                if np.max(np.fabs(vsort) > 299792.458):
+#                                    input("Paused for vsort check")
+#                                if np.min(lgrat) < lgratlo:
+#                                    lgratlo = np.min(lgrat)
+#                                    qqq = np.squeeze(np.extract(lgrat == lgratlo, cdx))
+#                                    ldx = -1
+#                                    if qqq.size > 1:
+#                                        ldx = qqq[0]
+#                                    elif qqq.size == 1:
+#                                        ldx = qqq
+#                                    ldx = np.squeeze(ldx)
+#                                if ldx >= 0:
+#                                    if np.max(lgrat) > lgrathi:
+#                                        lgrathi = np.max(lgrat)
+#                                        ldx = np.extract(lgrat == lgrathi, cdx)
+#                                    if (True):
+#                                        counts, bins = np.histogram(lgrat, bins=30)
+#                                        if np.sum(counts) > 50:
                                             # Least squares fit. Starting values found by inspection.
                                             # Best fit: [ 3.81359878e+02, -1.61440791e-01,  2.41220880e-01,  1.59874282e+02,       6.71831581e-01,  4.95647312e-01]
                                             # Root at 0.22411076198716937
-                                            fbins = bins[:-1] + 0.5*(bins[1]-bins[0])
-                                            fit = leastsq(double_gaussian_fit, [np.max(counts),                                   -1.57728785e-01,  2.41639639e-01,
-                                                                                (1.48498268e+02/3.78872182e+02) * np.max(counts),  6.51444240e-01,  5.14383209e-01 ], args=(fbins, counts))
-                                            xlo = 0.5 * (fit[0][1] + fit[0][4])
-                                            xhi = xlo
-                                            while diff_gaussian(xlo, fit[0]) / diff_gaussian(xhi, fit[0]) > 0:
-                                                xlo -= 0.01 * np.min([fit[0][2], fit[0][5]])
-                                                xhi += 0.01 * np.min([fit[0][2], fit[0][5]])
-                                            x = rs(diff_gaussian, args=fit[0], bracket=[xlo,xhi])
+#                                            fbins = bins[:-1] + 0.5*(bins[1]-bins[0])
+#                                            fit = leastsq(double_gaussian_fit, [np.max(counts),                                   -1.57728785e-01,  2.41639639e-01,
+#                                                                                (1.48498268e+02/3.78872182e+02) * np.max(counts),  6.51444240e-01,  5.14383209e-01 ], args=(fbins, counts))
+#                                            xlo = 0.5 * (fit[0][1] + fit[0][4])
+#                                            xhi = xlo
+#                                            while diff_gaussian(xlo, fit[0]) / diff_gaussian(xhi, fit[0]) > 0:
+#                                                xlo -= 0.01 * np.min([fit[0][2], fit[0][5]])
+#                                                xhi += 0.01 * np.min([fit[0][2], fit[0][5]])
+#                                            x = rs(diff_gaussian, args=fit[0], bracket=[xlo,xhi])
 
-                                        counts2, bins2 = np.histogram(subvabs, bins=30)
-                                        if np.sum(counts2) > 50:
-                                            fbins2 = bins2[:-1] + 0.5*(bins2[1]-bins2[0])
-                                            fit2 = leastsq(dbl_gaussian_cnst_fit, [np.max(counts2), -2.5e+03,  1.0e+03,
-                                                                                   np.max(counts2),  1.5e+03,  1.5e+03,
-                                                                                   counts2[2]], args=(fbins2, counts2))
-                                            #Result: fit2[0] = array([45.74215452, -2271.65388937, 831.85274261, 80.21174863, 1091.78998613, -242.20382901, 18.32894026])
+#                                        counts2, bins2 = np.histogram(subvabs, bins=30)
+#                                        if np.sum(counts2) > 50:
+#                                            fbins2 = bins2[:-1] + 0.5*(bins2[1]-bins2[0])
+#                                            fit2 = leastsq(dbl_gaussian_cnst_fit, [np.max(counts2), -2.5e+03,  1.0e+03,
+#                                                                                   np.max(counts2),  1.5e+03,  1.5e+03,
+#                                                                                   counts2[2]], args=(fbins2, counts2))
+#                                            #Result: fit2[0] = array([45.74215452, -2271.65388937, 831.85274261, 80.21174863, 1091.78998613, -242.20382901, 18.32894026])
 
-                                        plt.clf()
-                                        plt.subplot(221)
-                                        plt.plot(vabs[cdx],rat,"ob")
-                                        plt.plot([np.min(vabs[cdx]),   np.max(vabs[cdx])],   [np.median(rat),np.median(rat)],"r--")
-                                        if np.sum(counts) > 50:
-                                            if (fit[0][0] > 0) and (fit[0][1] > np.min(lgrat))  and (fit[0][1] < np.max(lgrat)):
-                                                plt.plot([np.min(vabs[cdx]), np.max(vabs[cdx])], np.power(10.0,[fit[0][1],fit[0][1]]),"m--")
-                                            if fit[0][3] > 0 and (fit[0][4] > np.min(lgrat))  and (fit[0][4] < np.max(lgrat)):
-                                                plt.plot([np.min(vabs[cdx]), np.max(vabs[cdx])], np.power(10.0,[fit[0][4],fit[0][4]]),"m--")
-                                        plt.plot([np.median(vabs[cdx]),np.median(vabs[cdx])],[np.min(rat),   np.max(rat)],   "r--")
-                                        xlo, xhi = plt.xlim()
-                                        plt.yscale("log")
-                                        plt.title(("qnum {} median vabs {} km/s median ratio {} nq {} nnq {}").format(sdss.qnum[q], np.median(vabs[cdx]), np.median(rat), nq, nnq))
-                                        plt.ylabel("W(N V 1238)/W(C IV 1548)")
+#                                        plt.clf()
+#                                        plt.subplot(221)
+#                                        plt.plot(vabs[cdx],rat,"ob")
+#                                        plt.plot([np.min(vabs[cdx]),   np.max(vabs[cdx])],   [np.median(rat),np.median(rat)],"r--")
+#                                        if np.sum(counts) > 50:
+#                                            if (fit[0][0] > 0) and (fit[0][1] > np.min(lgrat))  and (fit[0][1] < np.max(lgrat)):
+#                                                plt.plot([np.min(vabs[cdx]), np.max(vabs[cdx])], np.power(10.0,[fit[0][1],fit[0][1]]),"m--")
+#                                            if fit[0][3] > 0 and (fit[0][4] > np.min(lgrat))  and (fit[0][4] < np.max(lgrat)):
+#                                                plt.plot([np.min(vabs[cdx]), np.max(vabs[cdx])], np.power(10.0,[fit[0][4],fit[0][4]]),"m--")
+#                                        plt.plot([np.median(vabs[cdx]),np.median(vabs[cdx])],[np.min(rat),   np.max(rat)],   "r--")
+#                                        xlo, xhi = plt.xlim()
+#                                        plt.yscale("log")
+#                                        plt.title(("qnum {} median vabs {} km/s median ratio {} nq {} nnq {}").format(sdss.qnum[q], np.median(vabs[cdx]), np.median(rat), nq, nnq))
+#                                        plt.ylabel("W(N V 1238)/W(C IV 1548)")
 
-                                        plt.subplot(223)
-                                        plt.step(vsort, (1+np.arange(vsort.size))/vsort.size)
+#                                        plt.subplot(223)
+#                                        plt.step(vsort, (1+np.arange(vsort.size))/vsort.size)
 #                                        plt.xlim([xlo,xhi])
 #                                        if np.min(np.extract(vsort > xlo, (1+np.arange(vsort.size))/vsort.size)) < 1:
 #                                            plt.ylim([np.min(np.extract(vsort > xlo, (1+np.arange(vsort.size))/vsort.size)),1])
-                                        plt.xlabel("Relative Velocity (km/s)")
-                                        plt.yscale("log")
+#                                        plt.xlabel("Relative Velocity (km/s)")
+#                                        plt.yscale("log")
 
 
-                                        plt.subplot(222)
-                                        plt.stairs(counts, bins)
-                                        plt.xlim([bins[0],bins[-1]])
-                                        plt.ylim([0,1.1*np.max(counts)])
-                                        plt.xlabel("log W(N V 1238)/W(C IV 1548)")
+#                                        plt.subplot(222)
+#                                        plt.stairs(counts, bins)
+#                                        plt.xlim([bins[0],bins[-1]])
+#                                        plt.ylim([0,1.1*np.max(counts)])
+#                                        plt.xlabel("log W(N V 1238)/W(C IV 1548)")
 
-                                        if np.sum(counts) > 50:
-                                            # Least squares fit. Starting values found by inspection.
-                                            bbins = np.interp(np.arange(10*fbins.size)/10, np.arange(fbins.size), fbins)
-                                            plt.plot(bbins, double_gaussian(bbins, fit[0]),  'r' )
-                                            if x.converged:
-                                                plt.plot([x.root,x.root],[0,np.max(counts)],"m--")
-                                            if fit[0][0] > 0.0:
-                                                plt.plot(bbins, one_gaussian(bbins, fit[0][:3]), 'g--' )
-                                            if fit[0][3] > 0.0:
-                                                plt.plot(bbins, one_gaussian(bbins, fit[0][3:]), 'g--' )
-                                            plt.title(fit[0])
-                                        else:
-                                            plt.title((" {} counts").format(np.sum(counts)))
+#                                        if np.sum(counts) > 50:
+#                                            # Least squares fit. Starting values found by inspection.
+#                                            bbins = np.interp(np.arange(10*fbins.size)/10, np.arange(fbins.size), fbins)
+#                                            plt.plot(bbins, double_gaussian(bbins, fit[0]),  'r' )
+#                                            if x.converged:
+#                                                plt.plot([x.root,x.root],[0,np.max(counts)],"m--")
+#                                            if fit[0][0] > 0.0:
+#                                                plt.plot(bbins, one_gaussian(bbins, fit[0][:3]), 'g--' )
+#                                            if fit[0][3] > 0.0:
+#                                                plt.plot(bbins, one_gaussian(bbins, fit[0][3:]), 'g--' )
+#                                            plt.title(fit[0])
+#                                        else:
+#                                            plt.title((" {} counts").format(np.sum(counts)))
 
-                                        plt.subplot(224)
-                                        plt.stairs(counts2, bins2)
-                                        plt.xlabel("Relative Velocity (km/s)")
-                                        plt.xlim([xlo,xhi])
-                                        plt.ylim([0,1.1*np.max(counts2)])
-                                        if np.sum(counts) > 50:
-                                            bbins2 = np.interp(np.arange(10*fbins2.size)/10, np.arange(fbins2.size), fbins2)
-                                            plt.plot(bbins2, dbl_gaussian_cnst(bbins2, fit2[0]),  'r' )
+#                                        plt.subplot(224)
+#                                        plt.stairs(counts2, bins2)
+#                                        plt.xlabel("Relative Velocity (km/s)")
+#                                        plt.xlim([xlo,xhi])
+#                                        plt.ylim([0,1.1*np.max(counts2)])
+#                                        if np.sum(counts) > 50:
+#                                            bbins2 = np.interp(np.arange(10*fbins2.size)/10, np.arange(fbins2.size), fbins2)
+#                                            plt.plot(bbins2, dbl_gaussian_cnst(bbins2, fit2[0]),  'r' )
                                             if fit2[0][0] > 0.0:
                                                 plt.plot(bbins2, one_gaussian(bbins2, fit2[0][:3]), 'g--' )
                                             if fit2[0][3] > 0.0:
@@ -700,7 +641,6 @@ if dofit or dosearch or specid:
 ##
 ##                    plt.pause(0.001)
 
-            
     if dofit:
         qstart = -1
         data   = ascii.read("../../aalsearch.dat", format="no_header")
@@ -970,3 +910,4 @@ if False: # This is just for trying stuff on individual objects
 
 
 
+"""

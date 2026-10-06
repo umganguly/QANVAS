@@ -1,45 +1,381 @@
 import os
 import numpy             as np
 import matplotlib.pyplot as plt
-import scipy             as sp
-import time
+#import scipy             as sp
+#import time
 
-from scipy                   import special
-from scipy.cluster.hierarchy import dendrogram
-from scipy.interpolate       import CubicSpline
-from scipy.optimize          import leastsq
+#from scipy                   import special
+#from scipy.cluster.hierarchy import dendrogram
+#from scipy.interpolate       import CubicSpline
+#from scipy.optimize          import leastsq
 from astropy.coordinates     import SkyCoord
 from astropy                 import units                   as u
-from astropy.io              import fits, ascii
-from astropy.table           import QTable,Table,Column
+from astropy.io              import fits
+#from astropy.table           import QTable,Table,Column
+from astropy.table           import Table
 from astropy.cosmology       import FlatLambdaCDM
-from sklearn.decomposition   import NMF
-from sklearn.cluster         import AgglomerativeClustering as AG
+from astroquery.ipac.ned     import Ned
+#from sklearn.decomposition   import NMF
+#rom sklearn.cluster         import AgglomerativeClustering as AG
 from tqdm                    import tqdm
 
-from doppler                 import calcvel, calcwave
-from atomic                  import atomic
+#from doppler                 import calcvel, calcwave
+#from atomic                  import atomic
 from spectrum                import spectrum
 
 
 ###############################################################################################
 class sdsscat:
     ###############################################################################################
-    def __init__(self, basedir, samplefile, maxq, readog=False, readfits=False, finddups=False):
-        self.basedir    = basedir
+    def __init__(self, 
+                 mypars,
+                 ntabs = 0
+                 ):
+        fu = u.erg / u.cm**2 / u.s / u.Angstrom
+        self.mypars = mypars
 
-        if readog:
+        if self.mypars.nsamp == -1:
+            samplefile0 = self.mypars.basedir+"/qanvas_fullsamp.fits"
+            samplefile1 = self.mypars.basedir+"/qanvas_fullsamp_nodups.fits"
+            specmatfile = self.mypars.basedir+"/qanvas_specmat.fits"
+        else:
+            samplefile0 = self.mypars.basedir+f"/qanvas_n{self.mypars.nsamp}.fits"
+            samplefile1 = self.mypars.basedir+f"/qanvas_n{self.mypars.nsamp}_nodups.fits"
+            specmatfile = self.mypars.basedir+"/qanvas_specmat_n{self.mypars.nsamp}.fits"
+
+        if not os.path.exists(samplefile1):
+            if not os.path.exists(samplefile0):
+                print("\t"*ntabs + "Reading in original download_rsync.txt...\n")
+                data = Table.read(self.mypars.basedir+"/download_rsync.txt",
+                                format="ascii.fast_no_header"
+                                )
+                g = np.array(data['col1'])
+                self.fitsfile = np.array([], 
+                                        dtype='U30'
+                                        )
+                self.fileroot = np.array([], 
+                                        dtype='U30'
+                                        )
+                self.ra       = np.array([])
+                self.dec      = np.array([])
+                self.zqso     = np.array([])
+
+                plt.ion()
+                for line in tqdm(g, ncols=0, desc="\t"*ntabs + f"Looking for fits files in {self.mypars.basedir}"):
+                    fitsfile = line.rstrip()
+                    if os.path.exists(self.mypars.basedir+fitsfile):
+                        self.fitsfile = np.append(self.fitsfile, fitsfile)
+                        self.fileroot = np.append(self.fileroot, np.array(self.fitsfile[-1][self.fitsfile[-1].rfind("/")+1:self.fitsfile[-1].rfind(".f")], 
+                                                                        dtype='U30'
+                                                                        )
+                                                )
+                        ra,dec,zqso = self._get_fits_info(self.fitsfile[-1])
+                        self.ra   = np.append(self.ra,   ra)
+                        self.dec  = np.append(self.dec,  dec)
+                        self.zqso = np.append(self.zqso, zqso)
+
+                        self.qnum = np.arange(self.ra.size,dtype=np.int32)
+                        if self.ra.size % 100 == 2:
+                            #print(f"{self.qnum[-1]:5d} {self.ra[-1]:10.5f} {self.dec[-1]:10.6f} {self.zqso[-1]:8.5f} {self.fileroot[-1]:30s}")
+                            self._plot_dist()
+                            plt.pause(0.01)
+
+                    if self.ra.size >= self.mypars.nsamp and self.mypars.nsamp > 0:
+                        break
+
+                self._write_sample(samplefile0)
+
+            self._read_sample(samplefile0, 
+                              ntabs = ntabs+1
+                              )
+
+            newq      = np.copy(self.qnum)
+            sdsssupercat = SkyCoord(ra=self.ra*u.degree,dec=self.dec*u.degree)
+            for q in tqdm(range(self.ra.size), ncols=0, desc="\t"*ntabs + "Looking for duplicates"):
+                if newq[q] == self.qnum[q]: # Try this to speed things up.. don't need to repeat things
+                    s          = SkyCoord(ra=self.ra[q]*u.degree,dec=self.dec[q]*u.degree)
+                    ss         = s.separation(sdsssupercat).arcsecond
+                    ssdx       = np.extract(ss < 1.0, np.arange(self.qnum.size, dtype=np.int32))
+                    if ssdx.size > 1:
+                        print("\t"*ntabs + "Duplicates for ",q," found in ",ssdx)
+                    newq[ssdx] = np.min(self.qnum[ssdx])
+            self.qnum      = np.copy(newq)
+            self._write_sample(samplefile1)
+
+        self._read_sample(samplefile1,
+                          ntabs = ntabs+1
+                          )
+        print("\t"*ntabs + f"Sample has {np.unique(self.qnum).size} unique objects out of {self.qnum.size}")
+
+        if not os.path.exists(specmatfile):
+            speclist = self._speclist(ntabs = ntabs+1)
+            rest_wavelength,fluxmat = self._the_matrix(speclist,
+                                                       ntabs = ntabs+1)
+
+            The_Matrix = Table(data=[rest_wavelength,fluxmat.T],
+                               names=["rest_wave","fluxmat"]
+                               )
+            The_Matrix.write(specmatfile,
+                             format="fits"
+                             )
+
+        print("\t"*ntabs + "Reading in wavelength-normalized flux matrix")
+        The_Matrix = Table.read(specmatfile,
+                                format="fits"
+                                )
+        self.rest_wavelength = The_Matrix['rest_wave'] * u.Angstrom
+        self.fluxmat = The_Matrix['fluxmat'].T * 1.0e-17 * fu
+
+        qunique, quidx = np.unique(self.qnum,
+                                   return_index=True
+                                   )
+
+        if not os.path.exists(self.mypars.basedir+"/NED_photometry"):
+            os.mkdir(self.mypars.basedir+"/NED_photometry")
+        plt.gcf()
+        for i in tqdm(range(quidx.size), ncols=0, desc="Fetching NED photometry"):
+            qskycoord = SkyCoord(self.ra[quidx[i]] * u.deg,
+                                 self.dec[quidx[i]] * u.deg
+                                 )
+            nedphotfile = self.mypars.basedir+f"/NED_photometry/{self.fileroot[quidx[i]]}.fits"
+            if os.path.exists(nedphotfile):
+                photometry_table = Table.read(nedphotfile,
+                                              format='fits'
+                                              )
+            else:
+                photometry_table = self._ned_photometry(qskycoord)
+                if 'description' in photometry_table.meta:
+                    del photometry_table.meta['description']
+                photometry_table.write(nedphotfile,
+                                       format="fits"
+                                       )
+
+            non_zero_mask = self.fluxmat[i,:] > 0
+
+            if np.sum(non_zero_mask) > 0:
+                lumdist = FlatLambdaCDM(H0=70,
+                                        Om0=0.3
+                                        ).luminosity_distance(self.zqso[quidx[i]]).to(u.cm)
+                plt.clf()
+                plt.step(self.rest_wavelength[non_zero_mask],
+                         self.fluxmat[i,non_zero_mask] * self.rest_wavelength[non_zero_mask] * (1 + self.zqso[quidx[i]]) * 4 * np.pi * lumdist**2
+                         )
+
+                photo_restwave = photometry_table['Frequency'].to(u.Angstrom, equivalencies=u.spectral())  / (1 + self.zqso[quidx[i]])
+                photo_nuFnu = photometry_table['Flux Density'].to(u.erg/u.cm**2/u.s/u.Hz) * photometry_table['Frequency']
+                plt.scatter(photo_restwave,
+                            photo_nuFnu * 4 * np.pi * lumdist**2
+                            )
+
+                plt.title(f"{self.fileroot[quidx[i]]}")
+                plt.xscale("log")
+                plt.yscale("log")
+                plt.show(block=False)
+                plt.pause(5)
+
+        #self.composite_flux = self._composite_spectrum(ntabs = ntabs+1)
+
+        #plt.gcf()
+        #for i in tqdm(range(self.fluxmat.shape[1]), ncols=0, desc="Plotting SEDs"):
+        #    non_zero_mask = self.fluxmat[:,i] > 0
+        #    plt.step(self.rest_wavelength[non_zero_mask],
+        #             self.fluxmat[non_zero_mask,i])
+
+        #    plt.scatter(self.photometry_table[i]['Frequency'].to(u.Angstrom, equivalencies=u.spectral()),
+        #                self.photometry_table[i]['Flux Density'].to(fu, equivalencies=u.spectral())
+        #                )
+        #plt.xscale("log")
+        #plt.yscale("log")
+        #plt.show()
+
+    ###############################################################################################
+    def _composite_spectrum(self,
+                            ntabs = 0
+                            ):
+        composite_flux = np.zeros(self.rest_wavelength.size)
+        for i in tqdm(range(self.rest_wavelength.size), ncols=0, desc="\t"*ntabs + "Computing composite spectrum"):
+            non_zero_mask = self.fluxmat[:,i] > 0
+            composite_flux[i] = np.average(self.fluxmat[non_zero_mask,i])
+        fig = plt.gcf()
+        fig.clf()
+        plt.step(self.rest_wavelength,
+                 composite_flux
+                 )
+        plt.show(block=False)
+
+        return composite_flux
+
+    ###############################################################################################
+    def _get_fits_info(self,
+                       fitsfile
+                       ):
+        with fits.open(self.mypars.basedir+fitsfile) as hdul:
+            ra   = hdul[0].header['plug_ra']
+            dec  = hdul[0].header['plug_dec']
+            zqso = hdul[2].data['z'][0]
+
+        return ra,dec,zqso
+
+    ###############################################################################################
+    def _ned_photometry(self,
+                        qskycoord
+                        ):
+        result_table = Ned.query_region(qskycoord, 
+                                        radius = 5 * u.arcsec
+                                        )
+        redshift_mask = result_table['Redshift Points'] == np.max(result_table['Redshift Points'])
+        photometry_table = Ned.get_table(result_table[redshift_mask]['Object Name'])
+        broad_band_mask = (photometry_table['Frequency Mode'] == "Broad-band measurement") & \
+                            (photometry_table['Flux Density'] > 0)
+        #photometry_table[broad_band_mask]['Frequency', 'Flux Density', 'Upper limit of uncertainty', 'Lower limit of uncertainty', 'Upper limit of Flux Density', 'Lower limit of Flux Density', 'NED Uncertainty', 'NED Units'].pprint()
+
+        return photometry_table[broad_band_mask]['Frequency', 'Flux Density', 'Upper limit of uncertainty', 'Lower limit of uncertainty']
+
+    ###############################################################################################
+    def _plot_dist(self):
+        fig = plt.gcf()
+        fig.clf()
+        #fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+        #fig.delaxes(ax1)
+        ax1 = fig.add_subplot(1, 2, 1, projection='aitoff')
+        ax1.scatter(self.ra, 
+                    self.dec, 
+                    s = self.zqso, 
+                    color = 'red', 
+                    marker = 'o'
+                    )
+        ax1.grid(True)
+
+        ax2 = fig.add_subplot(1, 2, 2)
+        ax2.step(np.sort(self.zqso),
+                 np.arange(self.zqso.size)/self.zqso.size
+                 )
+        ax2.plot([np.min(self.zqso),np.max(self.zqso)],
+                 [0,1],
+                 "g--")
+        plt.show(block=False)
+        plt.pause(0.001)
+
+    ###############################################################################################
+    def _read_sample(self,
+                      samplefile,
+                      ntabs = 0
+                      ):
+        print("\t"*ntabs + f"Reading in {samplefile}")
+        sample = Table.read(samplefile,
+                            format="fits"
+                            )
+        self.qnum     = sample['qnum']
+        self.ra       = sample['RA']
+        self.dec      = sample['Dec']
+        self.zqso     = sample['zqso']
+        self.fileroot = sample['fileroot']
+        self.fitsfile = sample['fitsfile']
+
+    ###############################################################################################
+    def _speclist(self,
+                  ntabs = 0
+                  ):
+        speclist = []
+        for qnum in tqdm(np.unique(self.qnum), ncols=0, desc="\t"*ntabs + "Reading in quasar fits spectra"):
+            qnum_mask = self.qnum == qnum
+            fitsfiles = []
+            for f in self.fitsfile[qnum_mask]:
+                fitsfiles.append(f)
+
+            speclist.append(spectrum(self.mypars,
+                                        fitsfiles,
+                                        qnum,
+                                        self.zqso[qnum_mask][0],
+                                        ntabs = ntabs+1
+                                        )
+                            )
+        return speclist
+
+    ###############################################################################################
+    def _the_matrix(self,
+                    speclist,
+                    ntabs = 0
+                    ):
+        fig = plt.gcf()
+        plt.ion()
+        fig.clf()
+        for ax in fig.get_axes():
+            ax.remove()
+        ax = fig.add_axes((0.125, 0.1, 0.775, 0.8))
+        ax.set_axis_on()
+        plt.ion()
+
+        rest_wavelength = np.array([])
+        for spec in tqdm(speclist, ncols=0, desc="\t"*ntabs+"Entering The Matrix"):
+            if rest_wavelength.size == 0:
+                rest_wavelength = np.copy(spec.rest_wavelength)
+                nqso = np.ones(rest_wavelength.size)
+                fluxmat = np.copy(spec.flux)
+            else:
+                fluxmat = np.vstack((fluxmat, 
+                                        np.zeros(rest_wavelength.size))
+                                    )
+                between_mask = (rest_wavelength > np.min(spec.rest_wavelength)) & \
+                                (rest_wavelength < np.max(spec.rest_wavelength))
+                nqso[between_mask] += 1
+                fluxmat[-1,between_mask] = np.interp(rest_wavelength[between_mask],
+                                                        spec.rest_wavelength,
+                                                        spec.flux
+                                                        )
+
+                prepend_mask = spec.rest_wavelength < np.min(rest_wavelength)
+                append_mask  = spec.rest_wavelength > np.max(rest_wavelength)
+
+                if np.sum(prepend_mask):
+                    rest_wavelength = np.append(spec.rest_wavelength[prepend_mask], rest_wavelength)
+                    nqso = np.append(np.ones(np.sum(prepend_mask)), nqso)
+                    fluxmat = np.append(np.zeros((fluxmat.shape[0],
+                                                    np.sum(prepend_mask)
+                                                    )),
+                                        fluxmat,
+                                        axis=1
+                                        )
+                    fluxmat[-1,:np.sum(prepend_mask)] = np.copy(spec.flux[prepend_mask])
+                if np.sum(append_mask):
+                    rest_wavelength = np.append(rest_wavelength, spec.rest_wavelength[append_mask])
+                    nqso = np.append(nqso, np.ones(np.sum(append_mask)))
+                    fluxmat = np.append(fluxmat,
+                                        np.zeros((fluxmat.shape[0],
+                                                    np.sum(append_mask),
+                                                    )),
+                                        axis=1
+                                        )
+                    fluxmat[-1,-np.sum(append_mask):] = np.copy(spec.flux[append_mask])
+
+                ax.cla()
+                ax.step(rest_wavelength,
+                        nqso)
+                ax.step(rest_wavelength,
+                        fluxmat[-1,:] * np.max(nqso) / np.max(fluxmat[-1,:]))
+                plt.pause(0.001)
+
+        return rest_wavelength,fluxmat
+
+    ###############################################################################################
+    def _write_sample(self,
+                      samplefile
+                      ):
+        sample = Table(data=[self.qnum,self.ra,self.dec,self.zqso,self.fileroot,self.fitsfile],
+                    names=["qnum", "RA", "Dec", "zqso", "fileroot", "fitsfile"]
+                    )
+        sample.write(samplefile,
+                    format="fits",
+                    overwrite=True
+                    )
+
+"""
             self.qnum     = np.array([], dtype=np.int32)
-            self.ra       = np.array([])
-            self.dec      = np.array([])
-            self.zqso     = np.array([])
-            self.fitsfile = np.array([], dtype='U30')
-            self.fileroot = np.array([], dtype='U30')
             self.snr      = np.array([])
             if readfits:
                 print("Reading in original download_rsync.txt...\n")
                 data = ascii.read(basedir+"/download_rsync.txt",format="no_header")
-                g = np.array(data['col1'])
                 with open(samplefile, "w") as f:
                     for line in g:
                         self.fitsfile = np.append(self.fitsfile, np.array(self.basedir+line.rstrip(), dtype='U30'))
@@ -101,162 +437,6 @@ class sdsscat:
             print("Sample has ",np.unique(self.qnum).size," unique objects")
 
 
-    ###############################################################################################
-    def combinespec(self,zqso,sep,verbose=True):
-        with fits.open(self.basedir+self.fitsfile[sep[0]]) as hdul:
-            totflux = hdul[1].data['flux']
-            totwave = 10.0**hdul[1].data['loglam'] / (1.0+zqso)
-            totivar = hdul[1].data['ivar']
-        # Scale the spectrum by the average flux in the 1700-1738 A range
-        norm0 = np.average(np.extract((totwave > 1700) & (totwave < 1738.44), totflux))
-        totflux = totflux / norm0
-        totivar = totivar * norm0 * norm0
-        # Filter out wavelength bins where the recorded ivar is zero
-        nzdx      = np.extract(totivar > 0, range(totivar.size))
-        totflux   = totflux[nzdx]
-        totwave   = totwave[nzdx]
-        totjvar   = totivar[nzdx]
-        totivar   = np.multiply(totivar[nzdx], 1/np.square(totflux))
-        totlgflux = np.multiply(totjvar, np.log10(np.where(totflux <= 1/np.sqrt(totjvar), 1/np.sqrt(totjvar), totflux))) # Start of weighted sum
-        nq        = np.ones(nzdx.size, dtype=np.int32)
-
-        if verbose: print(f'            {sep[0]} Beginning with {totwave.size} bins from {totwave[0]} to {totwave[-1]}')
-
-        if sep.size > 1: # This is not the only one
-            for j in np.arange(1,sep.size,dtype=np.int32):
-                with fits.open(self.basedir+self.fitsfile[sep[j]]) as hdul:
-                    flux = hdul[1].data['flux']
-                    wave = 10.0**hdul[1].data['loglam'] / (1.0+zqso)
-                    ivar = hdul[1].data['ivar']
-                # Scale the spectrum by the average flux in the 1700-1738 A range
-                norm = np.average(np.extract((wave > 1700) & (wave < 1738.44), flux))
-                flux = flux / norm
-                ivar = ivar * norm * norm
-                # Filter out wavelength bins where the recorded ivar is zero
-                nzdx   = np.extract(ivar > 0, range(ivar.size))
-                flux   = flux[nzdx]
-                wave   = wave[nzdx]
-                ivar   = ivar[nzdx]
-
-                logf   = np.log10(np.where(flux <= 1/np.sqrt(ivar), 1/np.sqrt(ivar), flux))
-
-                # Prepend wavelengths smaller than totwave
-                pdx = np.array([])
-                wlo = np.max(wave[0])
-                if (np.min(totwave) > np.min(wave)):
-                    pdx       = np.extract(wave < np.min(totwave), np.arange(wave.size, dtype=np.int32))
-                    badness   = np.std(flux[pdx])/np.sqrt(np.average(ivar[pdx]))
-                    if badness < 1.0e+5:
-                        wlo = np.max(wave[pdx])
-                        if verbose: print(f'            {sep[j]} Prepending {pdx.size} bins from {wave[pdx[0]]} to {wave[pdx[-1]]} ({badness})')
-                        totwave   = np.concatenate((wave[pdx],                                      totwave))
-                        totlgflux = np.concatenate((np.multiply(ivar[pdx], logf[pdx]),            totlgflux))
-                        totjvar   = np.concatenate((ivar[pdx],                                      totjvar)) # This is for summing the weights
-                        totivar   = np.concatenate((np.multiply(ivar[pdx], 1/np.square(flux[pdx])), totivar)) # This is for propogating errors
-                        nq        = np.concatenate((np.ones(pdx.size,dtype=np.int32),                    nq))
-
-                # Append wavelengths larger than totwave
-                adx = np.array([])
-                whi = np.min(wave[-1])
-                if (np.max(totwave) < np.max(wave)):
-                    adx       = np.extract(wave > np.max(totwave), np.arange(wave.size, dtype=np.int32))
-                    badness   = np.std(flux[adx])/np.sqrt(np.average(ivar[adx]))
-                    if badness < 1.0e+5:
-                        whi = np.min(wave[adx])
-                        if verbose: print(f'            {sep[j]} Appending {adx.size} bins from {wave[adx[0]]} to {wave[adx[-1]]} ({badness})')
-                        totwave   = np.concatenate((  totwave,                                      wave[adx]))
-                        totlgflux = np.concatenate((totlgflux,              np.multiply(ivar[adx], logf[adx])))
-                        totjvar   = np.concatenate((  totjvar,                                      ivar[adx]))
-                        totivar   = np.concatenate((  totivar, np.multiply(ivar[adx], 1/np.square(flux[adx]))))
-                        nq        = np.concatenate((       nq,               np.ones(adx.size,dtype=np.int32)))
-
-                # Interpolate and add in the overlapping wavelength regions
-                # Problem here that we're using an already-expanded version of totwave?
-                ndx     = np.extract((totwave > wlo) & (totwave < whi), range(totwave.size))
-                ndx2    = np.extract((wave > np.min(totwave[ndx])) & (wave < np.max(totwave[ndx])), range(wave.size))
-                badness = np.std(flux[ndx2])/np.sqrt(np.average(ivar[ndx2]))
-                if badness < 1.0e+5:
-                    if verbose: print(f'            {sep[j]} Interpolating and combining {ndx.size} bins from {wlo} to {whi} ({badness})')
-                    spf = np.interp(totwave[ndx], wave, np.where(flux <= 1/np.sqrt(ivar), 1/np.sqrt(ivar), flux))
-                    spi = np.interp(totwave[ndx], wave, ivar)
-
-                    totlgflux[ndx] += np.multiply(spi, np.log10(spf)) # Note: This is a geometric mean since we averaging in log-space
-                    totjvar[ndx]   += spi
-                    totivar[ndx]   += np.multiply(spi, 1/np.square(spf))
-                    nq[ndx]        += 1
-
-                # If there are missing stretches of wavelength not covered by the previous spectrum, fill them in with the current spectrum
-                dw       = np.zeros(totwave.size)
-                dw[1:-1] = 0.5*(totwave[2:] - totwave[:-2])
-                dw[0]    = dw[1]
-                dw[-1]   = dw[-2]
-                missdx   = np.extract(dw > wave[-1]-wave[-2], range(totwave.size))
-                mdx1     = -1
-                for m in range(missdx.size):
-                    if m > mdx1:
-                        mdx1 = m
-                        if mdx1 < missdx.size-1:
-                            while (missdx[mdx1+1]-missdx[mdx1] == 1) and (mdx1 < missdx.size-1):
-                                mdx1 += 1
-                                if mdx1 >= missdx.size-2:
-                                    break
-                        wdx       = np.extract((wave > totwave[missdx[m]]) & (wave < totwave[missdx[mdx1]]), range(wave.size))
-                        if wdx.size > 2:
-                            scale = -1
-                            done = 0
-                            i = 0
-                            while (done == 0):
-                                i = i+1
-                                mstart = np.max([missdx[m]-i,    0])
-                                mend   = np.min([missdx[mdx1]+i, totlgflux.size-1])
-                                wstart = np.min([wdx[-1]-i,      0])
-                                wend   = np.min([wdx[0]+i,       flux.size-1])
-                                subf1  = np.where(flux[wdx[0]:wend]    < 0, 1/np.sqrt(ivar[wdx[0]:wend]),    flux[wdx[0]:wend])
-                                subf2  = np.where(flux[wstart:wdx[-1]] < 0, 1/np.sqrt(ivar[wstart:wdx[-1]]), flux[wstart:wdx[-1]])
-                                oldscale = scale
-                                scalelo = np.average(np.power(10.0, np.multiply(totlgflux[mstart:missdx[m]],  1 / totjvar[mstart:missdx[m]])))/np.average(subf1)
-                                scalehi = np.average(np.power(10.0, np.multiply(totlgflux[missdx[mdx1]:mend], 1 / totjvar[missdx[mdx1]:mend])))/np.average(subf2)
-                                scale   = np.average([scalelo, scalehi])
-                                if np.isnan(scale):
-                                    scale = scalelo
-                                    if np.isnan(scale):
-                                        scale = scalehi
-                                    if np.isnan(scale):
-                                        scale = 1
-                                if np.isnan(scale):
-                                    print("Encountered NaN!")
-                                    print("scalelo = ",scalelo," scalehi = ",scalehi)
-                                    print("totlgflux[mstart:missdx[m]] = ",  totlgflux[mstart:missdx[m]])
-                                    print("totlgflux[missdx[mdx1]:mend] = ", totlgflux[missdx[mdx1]:mend])
-                                    print("subf1 = ",subf1)
-                                    print("subf2 = ",subf2)
-                                    input("Paused - hit ctrl-C to stop")
-                                if verbose: print("                 ",i,mstart,missdx[m],mend,wstart,wdx[0],wdx[-1],wend,scale,np.fabs((scale-oldscale)/oldscale))
-                                if (np.fabs((scale-oldscale)/oldscale) < 0.01) and (scale > 0):
-                                    done = 1
-                            badness = np.std(flux[wdx])/np.sqrt(np.average(ivar[wdx]))
-                            if badness < 1.0e+5:
-                                if verbose: print(f'            {sep[j]} Filling in {wdx.size} missing values from {wave[wdx[0]]} to {wave[wdx[-1]]} with scale = {scale}  ({badness})')
-                                subf      = np.where(flux[wdx] > 1/np.sqrt(ivar[wdx]), flux[wdx], 1/np.sqrt(ivar[wdx])) * scale
-                                subiv     = ivar[wdx] / (scale * scale)
-                                totwave   = np.append(totwave,   wave[wdx])
-                                totlgflux = np.append(totlgflux, np.multiply(subiv, np.log10(subf)))
-                                totjvar   = np.append(totjvar,   subiv)
-                                totivar   = np.append(totivar,   np.multiply(subiv,  1/np.square(subf)))
-                                nq        = np.append(nq,        np.ones(wdx.size,dtype=np.int32))
-                sdx       = np.argsort(totwave)
-                totwave   = totwave[sdx]
-                totlgflux = totlgflux[sdx]
-                totjvar   = totjvar[sdx]
-                totivar   = totivar[sdx]
-                nq        = nq[sdx]
-
-        avetotlgflux = np.multiply(totlgflux, 1/totjvar)
-        totflux = np.power(10.0, avetotlgflux)
-
-        if verbose: print(f'            Returning {totwave.size} bins from {totwave[0]} to {totwave[-1]} ({totflux.size} {totivar.size})')
-
-        return totwave,totflux,totivar
 
     ###############################################################################################
 
@@ -1328,3 +1508,4 @@ class clustcompfit:
         specin[sdx] = np.interp(inwave[sdx],self.wave,spec)
         return specin
     
+"""

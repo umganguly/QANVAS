@@ -1,0 +1,3 @@
+basedir = "/mnt/data/QANVAS_data"
+verbose = True
+nsamp = 500

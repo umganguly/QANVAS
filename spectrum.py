@@ -39,7 +39,7 @@ class spectrum:
 
         gonogo = True
         for fitsfile in fitsfiles:
-            if not os.path.exists(fitsfile):
+            if not os.path.exists(self.mypars.basedir+fitsfile):
                 gonogo = False
 
         if gonogo:
@@ -47,16 +47,21 @@ class spectrum:
                                                         fitsfiles,
                                                         ntabs = ntabs+1
                                                         )
+            self.rest_wavelength = totwave
+            self.flux = totflux
+            self.ivar = totivar
+        else:
+            print("\t"*ntabs + f"No go for launch with the following files: {fitsfiles}")
 
 
     ###############################################################################################
     def combine_spec(self,
                      zqso,
                      fitsfiles,
-                     verbose=True,
+                     verbose=False,
                      ntabs = 0
                      ):
-        with fits.open(fitsfiles[0]) as hdul:
+        with fits.open(self.mypars.basedir+fitsfiles[0]) as hdul:
             totflux = hdul[1].data['flux']
             totwave = 10.0**hdul[1].data['loglam'] / (1.0+zqso)
             totivar = hdul[1].data['ivar']
@@ -75,9 +80,9 @@ class spectrum:
 
         if verbose: print("\t"*ntabs + f'Beginning with {totwave.size} bins from {totwave[0]} to {totwave[-1]}')
 
-        if fitsfiles.size > 1: # This is not the only one
-            for j in np.arange(1,fitsfiles.size,dtype=np.int32):
-                with fits.open(fitsfiles[j]) as hdul:
+        if len(fitsfiles) > 1: # This is not the only one
+            for j in np.arange(1,len(fitsfiles),dtype=np.int32):
+                with fits.open(self.mypars.basedir+fitsfiles[j]) as hdul:
                     flux = hdul[1].data['flux']
                     wave = 10.0**hdul[1].data['loglam'] / (1.0+zqso)
                     ivar = hdul[1].data['ivar']
