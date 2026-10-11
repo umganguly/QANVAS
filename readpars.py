@@ -71,3 +71,41 @@ class readpars:
          except AttributeError:
             print(f"Nsamp not defined in {inputfile}")
             self.nsamp = -1
+
+         try:
+            print(f"snr1300min = {self.snr1300min}")
+         except AttributeError:
+            print(f"snr1300min not defined in {inputfile}")
+            self.snr1300min = -1
+
+         try:
+            print(f"ned_photometry = {self.ned_photometry}")
+         except AttributeError:
+            print(f"ned_photometry not defined in {inputfile}")
+            self.ned_photometry = True
+
+         try:
+            print(f"sdss_composite = {self.sdss_composite}")
+         except AttributeError:
+            print(f"sdss_composite not defined in {inputfile}")
+            self.sdss_composite = True
+
+        ###########################################################################
+        # Clustering parameters
+         try:
+            print(f"clustering = {self.clustering}")
+         except AttributeError:
+            print(f"clustering not defined in {inputfile}")
+            self.clustering = True
+
+         try:
+            print(f"cluster_nsigma = {self.cluster_nsigma}")
+         except AttributeError:
+            print(f"cluster_nsigma not defined in {inputfile}")
+            self.cluster_nsigma = 3.0
+
+         try:
+            print(f"cluster_tol = {self.cluster_tol}")
+         except AttributeError:
+            print(f"cluster_tol not defined in {inputfile}")
+            self.cluster_tol = 1.0e-5
