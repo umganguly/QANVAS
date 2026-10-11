@@ -2,12 +2,15 @@ import os
 import numpy             as np
 import matplotlib.pyplot as plt
 #import scipy             as sp
+import sys
 #import time
 
 #from scipy                   import special
-#from scipy.cluster.hierarchy import dendrogram
+from scipy.cluster.hierarchy import dendrogram
 #from scipy.interpolate       import CubicSpline
 #from scipy.optimize          import leastsq
+from scipy.optimize          import root
+from astropy                 import constants               as const
 from astropy.coordinates     import SkyCoord
 from astropy                 import units                   as u
 from astropy.io              import fits
@@ -16,7 +19,7 @@ from astropy.table           import Table
 from astropy.cosmology       import FlatLambdaCDM
 from astroquery.ipac.ned     import Ned
 #from sklearn.decomposition   import NMF
-#rom sklearn.cluster         import AgglomerativeClustering as AG
+from sklearn.cluster         import AgglomerativeClustering as AG
 from tqdm                    import tqdm
 
 #from doppler                 import calcvel, calcwave
@@ -31,7 +34,10 @@ class sdsscat:
                  mypars,
                  ntabs = 0
                  ):
-        fu = u.erg / u.cm**2 / u.s / u.Angstrom
+        self.flambda_unit = u.erg / u.cm**2 / u.s / u.Angstrom
+        self.fefu = 1.0e-15 * self.flambda_unit
+        self.sdssfu = 0.01 * self.fefu
+
         self.mypars = mypars
 
         if self.mypars.nsamp == -1:
@@ -41,170 +47,430 @@ class sdsscat:
         else:
             samplefile0 = self.mypars.basedir+f"/qanvas_n{self.mypars.nsamp}.fits"
             samplefile1 = self.mypars.basedir+f"/qanvas_n{self.mypars.nsamp}_nodups.fits"
-            specmatfile = self.mypars.basedir+"/qanvas_specmat_n{self.mypars.nsamp}.fits"
+            specmatfile = self.mypars.basedir+f"/qanvas_specmat_n{self.mypars.nsamp}.fits"
 
+        print("\t"*ntabs + f"Looking for {samplefile1}")
         if not os.path.exists(samplefile1):
+            print("\t"*(ntabs+1) + "Not found...")
+            print("\t"*ntabs + f"Looking for {samplefile0}")
             if not os.path.exists(samplefile0):
-                print("\t"*ntabs + "Reading in original download_rsync.txt...\n")
-                data = Table.read(self.mypars.basedir+"/download_rsync.txt",
-                                format="ascii.fast_no_header"
-                                )
-                g = np.array(data['col1'])
-                self.fitsfile = np.array([], 
-                                        dtype='U30'
-                                        )
-                self.fileroot = np.array([], 
-                                        dtype='U30'
-                                        )
-                self.ra       = np.array([])
-                self.dec      = np.array([])
-                self.zqso     = np.array([])
-
-                plt.ion()
-                for line in tqdm(g, ncols=0, desc="\t"*ntabs + f"Looking for fits files in {self.mypars.basedir}"):
-                    fitsfile = line.rstrip()
-                    if os.path.exists(self.mypars.basedir+fitsfile):
-                        self.fitsfile = np.append(self.fitsfile, fitsfile)
-                        self.fileroot = np.append(self.fileroot, np.array(self.fitsfile[-1][self.fitsfile[-1].rfind("/")+1:self.fitsfile[-1].rfind(".f")], 
-                                                                        dtype='U30'
-                                                                        )
-                                                )
-                        ra,dec,zqso = self._get_fits_info(self.fitsfile[-1])
-                        self.ra   = np.append(self.ra,   ra)
-                        self.dec  = np.append(self.dec,  dec)
-                        self.zqso = np.append(self.zqso, zqso)
-
-                        self.qnum = np.arange(self.ra.size,dtype=np.int32)
-                        if self.ra.size % 100 == 2:
-                            #print(f"{self.qnum[-1]:5d} {self.ra[-1]:10.5f} {self.dec[-1]:10.6f} {self.zqso[-1]:8.5f} {self.fileroot[-1]:30s}")
-                            self._plot_dist()
-                            plt.pause(0.01)
-
-                    if self.ra.size >= self.mypars.nsamp and self.mypars.nsamp > 0:
-                        break
-
-                self._write_sample(samplefile0)
-
+                print("\t"*(ntabs+1) + "Not found...")
+                self._fetch_sample(samplefile0,
+                                   ntabs = ntabs+1
+                                   )
             self._read_sample(samplefile0, 
                               ntabs = ntabs+1
                               )
 
-            newq      = np.copy(self.qnum)
-            sdsssupercat = SkyCoord(ra=self.ra*u.degree,dec=self.dec*u.degree)
-            for q in tqdm(range(self.ra.size), ncols=0, desc="\t"*ntabs + "Looking for duplicates"):
-                if newq[q] == self.qnum[q]: # Try this to speed things up.. don't need to repeat things
-                    s          = SkyCoord(ra=self.ra[q]*u.degree,dec=self.dec[q]*u.degree)
-                    ss         = s.separation(sdsssupercat).arcsecond
-                    ssdx       = np.extract(ss < 1.0, np.arange(self.qnum.size, dtype=np.int32))
-                    if ssdx.size > 1:
-                        print("\t"*ntabs + "Duplicates for ",q," found in ",ssdx)
-                    newq[ssdx] = np.min(self.qnum[ssdx])
-            self.qnum      = np.copy(newq)
-            self._write_sample(samplefile1)
+            self._filter_duplicates(samplefile1,
+                                    ntabs = ntabs+1
+                                    )
 
         self._read_sample(samplefile1,
                           ntabs = ntabs+1
                           )
         print("\t"*ntabs + f"Sample has {np.unique(self.qnum).size} unique objects out of {self.qnum.size}")
 
+        print("\t"*ntabs + f"Looking for {specmatfile}")
         if not os.path.exists(specmatfile):
+            print("\t"*(ntabs+1) + "Not found...")
             speclist = self._speclist(ntabs = ntabs+1)
-            rest_wavelength,fluxmat = self._the_matrix(speclist,
-                                                       ntabs = ntabs+1)
+            rest_wavelength,fluxmat,ivarmat = self._the_matrix(speclist,
+                                                               ntabs = ntabs+1
+                                                               )
 
-            The_Matrix = Table(data=[rest_wavelength,fluxmat.T],
-                               names=["rest_wave","fluxmat"]
+            The_Matrix = Table(data=[rest_wavelength,fluxmat.T,ivarmat.T],
+                               names=["rest_wave","fluxmat","ivarmat"]
                                )
             The_Matrix.write(specmatfile,
-                             format="fits"
+                             format="fits",
+                             overwrite=True
                              )
 
-        print("\t"*ntabs + "Reading in wavelength-normalized flux matrix")
+        print("\t"*(ntabs+1) + "Reading in wavelength-normalized flux matrix")
         The_Matrix = Table.read(specmatfile,
                                 format="fits"
                                 )
         self.rest_wavelength = The_Matrix['rest_wave'] * u.Angstrom
-        self.fluxmat = The_Matrix['fluxmat'].T * 1.0e-17 * fu
+        self.fluxmat = The_Matrix['fluxmat'].T * self.sdssfu
+        self.ivarmat = The_Matrix['ivarmat'].T * 1/self.sdssfu**2
 
-        qunique, quidx = np.unique(self.qnum,
-                                   return_index=True
-                                   )
+        if self.mypars.snr1300min > 0:
+            dw1300 = np.fabs(self.rest_wavelength - 1300 * u.Angstrom)
+            w1300_mask = (dw1300 == np.min(dw1300))
+            snr1300 = np.squeeze(self.fluxmat[:,w1300_mask] * np.sqrt(self.ivarmat[:,w1300_mask]))
+            snr1300_mask = (snr1300 >= self.mypars.snr1300min)
 
-        if not os.path.exists(self.mypars.basedir+"/NED_photometry"):
-            os.mkdir(self.mypars.basedir+"/NED_photometry")
-        plt.gcf()
-        for i in tqdm(range(quidx.size), ncols=0, desc="Fetching NED photometry"):
-            qskycoord = SkyCoord(self.ra[quidx[i]] * u.deg,
-                                 self.dec[quidx[i]] * u.deg
-                                 )
-            nedphotfile = self.mypars.basedir+f"/NED_photometry/{self.fileroot[quidx[i]]}.fits"
-            if os.path.exists(nedphotfile):
-                photometry_table = Table.read(nedphotfile,
-                                              format='fits'
-                                              )
+            if np.sum(snr1300_mask) > 0:
+                print("\t"*ntabs + f"Filtering spectra down to {np.sum(snr1300_mask)} with S/N_1300 > {self.mypars.snr1300min}")
+                self.fluxmat = self.fluxmat[snr1300_mask,:]
+                self.ivarmat = self.ivarmat[snr1300_mask,:]
+
+        if self.mypars.ned_photometry:
+            self._ned_photometry_sample(ntabs = ntabs+1)
+
+        if self.mypars.sdss_composite or self.mypars.clustering:
+            self.composite_flux = self._composite_spectrum(np.arange(self.fluxmat.shape[0],
+                                                                     dtype = np.int16
+                                                                     ),
+                                                           ntabs = ntabs+1
+                                                           )
+
+        if self.mypars.clustering:
+            self._clustering(ntabs = ntabs+1)
+
+        input("paused")
+
+    ###############################################################################################
+    def _clustering(self,
+                    p = 10,
+                    ntabs = 0
+                    ):
+
+        #qmask = np.arange(self.fluxmat.shape[0], dtype=np.int16) != 73
+        #self.fluxmat = self.fluxmat[qmask,:]
+
+        new_fluxmat = np.copy(self.fluxmat)
+        for i in tqdm(range(new_fluxmat.shape[1]), ncols=0, desc="\t"*ntabs + f"Substituting composite flux in fluxmat"):
+            zero_mask = new_fluxmat[:,i] < sys.float_info.epsilon * self.sdssfu
+            if np.sum(zero_mask) > 0:
+                new_fluxmat[zero_mask,i] = self.composite_flux[i]
+
+        model = AG(n_clusters=None,
+                   distance_threshold=0
+                   ).fit(new_fluxmat/self.sdssfu)
+
+        old_distance_average = np.zeros(new_fluxmat.shape[0]-1)
+        nit = 0
+        num_groups = 5
+        done = False
+        while not done:
+            nit += 1
+            random_sample = self._random_sdss_sample(idx = nit,
+                                                     ntabs = ntabs+1
+                                                     )
+            random_model = AG(n_clusters=None,
+                            distance_threshold=0
+                            ).fit(random_sample/self.sdssfu)
+            try:
+                rand_distance_array = np.vstack((rand_distance_array, 
+                                                random_model.distances_
+                                                ))
+            except:
+                rand_distance_array = np.copy(random_model.distances_)
+
+            rand_distance_average = np.average(rand_distance_array,
+                                                axis = 0
+                                                )
+            rand_distance_stddev  = np.std(rand_distance_array,
+                                            axis = 0
+                                            )
+
+            # Better idea than this... we should do a root find on the interpolation of f(x) = model.distances_ - random_model.distances_
+            breaking_point = model.distances_ > rand_distance_average + self.mypars.cluster_nsigma * rand_distance_stddev
+            res = root(fun=lambda x: np.interp(x, 
+                                                np.arange(model.distances_.size), 
+                                                model.distances_ - (random_model.distances_ + self.mypars.cluster_nsigma * rand_distance_stddev)
+                                                ),
+                        x0 = np.min(model.distances_[breaking_point])
+                        )
+            if res.success:
+                breaking_distance = np.interp(res.x, 
+                                                np.arange(model.distances_.size), 
+                                                model.distances_
+                                                )[0]
             else:
-                photometry_table = self._ned_photometry(qskycoord)
-                if 'description' in photometry_table.meta:
-                    del photometry_table.meta['description']
-                photometry_table.write(nedphotfile,
-                                       format="fits"
-                                       )
+                breaking_distance = np.min(model.distances_[breaking_point])
 
-            non_zero_mask = self.fluxmat[i,:] > 0
+            num_groups = 1 + np.sum(model.distances_ > breaking_distance)
 
-            if np.sum(non_zero_mask) > 0:
-                lumdist = FlatLambdaCDM(H0=70,
-                                        Om0=0.3
-                                        ).luminosity_distance(self.zqso[quidx[i]]).to(u.cm)
+            fracerr = np.fabs(rand_distance_average-old_distance_average)/(old_distance_average+sys.float_info.epsilon)
+            if np.all(fracerr < self.mypars.cluster_tol):
+                done = True
+            else:
+                old_distance_average = rand_distance_average
+                print("\t"*(ntabs+1) + f"Haven't coverged yet: {np.max(fracerr):e} {np.sum(fracerr >= self.mypars.cluster_tol)} {breaking_distance} {num_groups}")
+
+            if nit % num_groups == num_groups-1:
                 plt.clf()
-                plt.step(self.rest_wavelength[non_zero_mask],
-                         self.fluxmat[i,non_zero_mask] * self.rest_wavelength[non_zero_mask] * (1 + self.zqso[quidx[i]]) * 4 * np.pi * lumdist**2
-                         )
+                plt.subplot(211)
+                plt.title(f"{nit}: {num_groups}")
+                self._clustering_plot_linkage_distance(model,
+                                                       rand_distance_average,
+                                                       rand_distance_stddev,
+                                                       breaking_distance
+                                                       )
 
-                photo_restwave = photometry_table['Frequency'].to(u.Angstrom, equivalencies=u.spectral())  / (1 + self.zqso[quidx[i]])
-                photo_nuFnu = photometry_table['Flux Density'].to(u.erg/u.cm**2/u.s/u.Hz) * photometry_table['Frequency']
-                plt.scatter(photo_restwave,
-                            photo_nuFnu * 4 * np.pi * lumdist**2
-                            )
+                plt.subplot(212)
+                self._clustering_plot_dendrogram(model, 
+                                                truncate_mode="level", 
+                                                p=p
+                                                )
+                xlo,xhi = plt.xlim()
+                plt.plot([xlo,xhi],
+                        [breaking_distance,breaking_distance],
+                        'k--'
+                        )
+                plt.xlabel("Number of quasars in node (or index of quasar if no parenthesis).")
+                plt.ylabel("Linkage Distance")
 
-                plt.title(f"{self.fileroot[quidx[i]]}")
-                plt.xscale("log")
-                plt.yscale("log")
                 plt.show(block=False)
-                plt.pause(5)
+                plt.pause(0.01)
 
-        #self.composite_flux = self._composite_spectrum(ntabs = ntabs+1)
+        plt.clf()
+        plt.subplot(211)
+        self._clustering_plot_dendrogram(model, 
+                                        truncate_mode="level", 
+                                        p=p
+                                        )
+        xlo,xhi = plt.xlim()
+        plt.plot([xlo,xhi],
+                [breaking_distance,breaking_distance],
+                'k--'
+                )
+        plt.xlabel("Number of quasars in node (or index of quasar if no parenthesis).")
+        plt.ylabel("Linkage Distance")
 
-        #plt.gcf()
-        #for i in tqdm(range(self.fluxmat.shape[1]), ncols=0, desc="Plotting SEDs"):
-        #    non_zero_mask = self.fluxmat[:,i] > 0
-        #    plt.step(self.rest_wavelength[non_zero_mask],
-        #             self.fluxmat[non_zero_mask,i])
+        plt.subplot(212)
+        print("\t" * (ntabs+1) + f"Grabbing composites for {num_groups} groups with linkage distance < {breaking_distance}")
+        wave_mask = ((self.rest_wavelength < 1750 * u.Angstrom) | (self.rest_wavelength > 1802 * u.Angstrom)) & \
+                    ((self.rest_wavelength < 2809 * u.Angstrom) | (self.rest_wavelength > 2959 * u.Angstrom))
+        qdx = self._clustering_find_group_membership(model,
+                                                        breaking_distance
+                                                        )
 
-        #    plt.scatter(self.photometry_table[i]['Frequency'].to(u.Angstrom, equivalencies=u.spectral()),
-        #                self.photometry_table[i]['Flux Density'].to(fu, equivalencies=u.spectral())
-        #                )
-        #plt.xscale("log")
-        #plt.yscale("log")
-        #plt.show()
+        offset = 0
+        fmax = 0
+        for group_number in np.unique(qdx):
+            group_members = np.arange(model.distances_.shape[0]+1)[qdx == group_number]
+            print("\t" * (ntabs+2) + f"Group {group_number} membership: {' '.join(map(str, group_members))}")
+            if group_members.size > 1:
+                group_composite = self._composite_spectrum(group_members,
+                                                        ntabs = ntabs+3
+                                                        )
+            else:
+                group_composite = np.copy(new_fluxmat[group_number,:])
+            plt.step(self.rest_wavelength,
+                    group_composite/self.sdssfu + offset,
+                    label = f"{group_number} ({group_members.size})")
+            if np.max(group_composite[wave_mask]/self.sdssfu) + offset > fmax:
+                fmax = np.max(group_composite[wave_mask]/self.sdssfu) + offset
+                print("\t" * (ntabs+2) + f"New fmax = {fmax}")
+            offset += 2
+        plt.ylim(top = fmax)
+        plt.xlabel('Rest Wavelenghth [Angstrom]')
+        plt.ylabel('Group Composite Flux')
+        plt.legend(ncols = 1 + num_groups//6)
+
+        plt.show(block=False)
+        plt.pause(0.01)
+
+    ###############################################################################################
+    def _clustering_find_group_membership(self,
+                               model,
+                               breaking_distance
+                               ):
+
+        qdx = np.arange(model.distances_.shape[0]+1, 
+                        dtype=np.int16
+                        )
+
+        nit = np.sum(model.distances_ <= breaking_distance)
+
+        for i in range(nit):
+            m1,m2 = model.children_[i,:]
+
+            m1_mask = (qdx == m1)
+            m2_mask = (qdx == m2)
+
+            new_group = np.max(qdx) + 1
+
+            qdx[m1_mask] = new_group
+            qdx[m2_mask] = new_group
+
+        return qdx
+
+    ###############################################################################################
+    def _clustering_plot_dendrogram(self,
+                                    model, 
+                                    **kwargs
+                                    ):
+        # create the counts of samples under each node
+        counts = np.zeros(model.children_.shape[0])
+        n_samples = len(model.labels_)
+        for i, merge in enumerate(model.children_):
+            current_count = 0
+            for child_idx in merge:
+                if child_idx < n_samples:
+                    current_count += 1  # leaf node
+                else:
+                    current_count += counts[child_idx - n_samples]
+            counts[i] = current_count
+
+        linkage_matrix = np.column_stack(
+            [model.children_, model.distances_, counts]
+        ).astype(float)
+
+        # Plot the corresponding dendrogram
+        dendrogram(linkage_matrix, **kwargs)
+
+    ###############################################################################################
+    def _clustering_plot_linkage_distance(self,
+                                          model,
+                                          rand_distance_average,
+                                          rand_distance_stddev,
+                                          breaking_distance
+                                          ):
+        plt.fill_between(np.arange(model.distances_.size),
+                            rand_distance_average + rand_distance_stddev,
+                            rand_distance_average - rand_distance_stddev,
+                            alpha=0.5
+                            )
+        plt.step(np.arange(model.distances_.size),
+                rand_distance_average,
+                label="Random Linkage distance"
+                )
+        plt.step(np.arange(model.distances_.size),
+                model.distances_,
+                label="SDSS Linkage distance"
+                )
+        plt.plot([0,model.distances_.size],
+                [breaking_distance,breaking_distance],
+                'k--'
+                )
+        plt.yscale('log')
+        plt.ylabel("Linkage Distance")
+        plt.legend()
 
     ###############################################################################################
     def _composite_spectrum(self,
+                            qdx,
+                            plotspec = False,
                             ntabs = 0
                             ):
-        composite_flux = np.zeros(self.rest_wavelength.size)
+        composite_flux = np.zeros(self.rest_wavelength.size) * self.sdssfu
+        stddev_flux    = np.zeros(self.rest_wavelength.size) * self.sdssfu
         for i in tqdm(range(self.rest_wavelength.size), ncols=0, desc="\t"*ntabs + "Computing composite spectrum"):
-            non_zero_mask = self.fluxmat[:,i] > 0
-            composite_flux[i] = np.average(self.fluxmat[non_zero_mask,i])
-        fig = plt.gcf()
-        fig.clf()
-        plt.step(self.rest_wavelength,
-                 composite_flux
-                 )
-        plt.show(block=False)
+            non_zero_mask = self.fluxmat[qdx,i] > 0
+            if np.sum(non_zero_mask) > 0:
+                composite_flux[i] = 10.0**np.average(np.log10(self.fluxmat[qdx[non_zero_mask],i].to(self.sdssfu).value)) * self.sdssfu
+                stddev_flux[i]    = 10.0**np.std(np.log10(self.fluxmat[qdx[non_zero_mask],i].to(self.sdssfu).value)) * self.sdssfu
+
+        if plotspec:
+            fig = plt.gcf()
+            fig.clf()
+            plt.fill_between(self.rest_wavelength.value,
+                            (composite_flux+stddev_flux).value,
+                            (composite_flux-stddev_flux).value,
+                            alpha=0.2
+                            )
+            plt.step(self.rest_wavelength,
+                    composite_flux
+                    )
+            plt.xlabel("Rest Wavelength [Angstrom]")
+            plt.ylabel(f"Flux density [{self.flambda_unit}]")
+            plt.show(block=False)
 
         return composite_flux
 
+    ###############################################################################################
+    def _fetch_sample(self,
+                      samplefile0,
+                      ntabs = 0
+                      ):
+        print("\t"*ntabs + "Reading in original download_rsync.txt...\n")
+        data = Table.read(self.mypars.basedir+"/download_rsync.txt",
+                        format="ascii.fast_no_header"
+                        )
+        g = np.array(data['col1'])
+        self.fitsfile = np.array([], 
+                                dtype='U30'
+                                )
+        self.fileroot = np.array([], 
+                                dtype='U30'
+                                )
+        self.ra       = np.array([])
+        self.dec      = np.array([])
+        self.zqso     = np.array([])
+
+        plt.ion()
+        for line in tqdm(g, ncols=0, desc="\t"*ntabs + f"Looking for fits files in {self.mypars.basedir}"):
+            fitsfile = line.rstrip()
+            if os.path.exists(self.mypars.basedir+fitsfile):
+                self.fitsfile = np.append(self.fitsfile, fitsfile)
+                self.fileroot = np.append(self.fileroot, np.array(self.fitsfile[-1][self.fitsfile[-1].rfind("/")+1:self.fitsfile[-1].rfind(".f")], 
+                                                                dtype='U30'
+                                                                )
+                                        )
+                ra,dec,zqso = self._get_fits_info(self.fitsfile[-1])
+                self.ra   = np.append(self.ra,   ra)
+                self.dec  = np.append(self.dec,  dec)
+                self.zqso = np.append(self.zqso, zqso)
+
+                self.qnum = np.arange(self.ra.size,dtype=np.int32)
+                if self.ra.size % 100 == 2:
+                    self._plot_dist()
+                    plt.pause(0.01)
+
+            if self.ra.size >= self.mypars.nsamp and self.mypars.nsamp > 0:
+                break
+
+        self._write_sample(samplefile0)
+
+    ###############################################################################################
+    def _filter_duplicates(self,
+                           samplefile1,
+                           ntabs = 0
+                           ):
+        newq      = np.copy(self.qnum)
+        sdsssupercat = SkyCoord(ra=self.ra*u.degree,dec=self.dec*u.degree)
+        for q in tqdm(range(self.ra.size), ncols=0, desc="\t"*ntabs + "Looking for duplicates"):
+            if newq[q] == self.qnum[q]: # Try this to speed things up.. don't need to repeat things
+                s          = SkyCoord(ra=self.ra[q]*u.degree,dec=self.dec[q]*u.degree)
+                ss         = s.separation(sdsssupercat).arcsecond
+                ssdx       = np.extract(ss < 1.0, np.arange(self.qnum.size, dtype=np.int32))
+                if ssdx.size > 1:
+                    print("\t"*ntabs + "Duplicates for ",q," found in ",ssdx)
+                newq[ssdx] = np.min(self.qnum[ssdx])
+        self.qnum      = np.copy(newq)
+        self._write_sample(samplefile1)
+
+    ###############################################################################################
+    # The shape of self.fluxmat will be (number of quasars, number of wavelength bins)
+    def _generate_mock_sdss(self,
+                            ntabs = 0
+                            ):
+
+        try:
+            dum = self.fluxmat_sorted[0,0]
+        except:
+            self.fluxmat_sorted = np.copy(self.fluxmat)
+            self._gms_qdxs = np.zeros((self.fluxmat.shape[1],2), dtype=np.int16)
+            for i in range(self.fluxmat.shape[1]):
+                self.fluxmat_sorted[:,i] = np.sort(self.fluxmat[:,i])
+                non_zero_mask = (self.fluxmat_sorted[:,i] > sys.float_info.epsilon * self.sdssfu)
+                if np.sum(non_zero_mask) > 0:
+                    qdxs = np.arange(self.fluxmat.shape[0], dtype=np.int16)[non_zero_mask]
+                    self._gms_qdxs[i,0] = np.min(qdxs)
+                    self._gms_qdxs[i,1] = np.max(qdxs)
+                else:
+                    print("\t"*ntabs + f"No fluxes at wavelength {self.rest_wavelength[i]}")
+
+        rng = np.random.default_rng()
+
+        # Generate a 1D array of 5 random integers between 10 (inclusive) and 50 (exclusive)
+        mock_spectrum = np.zeros_like(self.fluxmat[0,:])
+        for i in range(self.fluxmat.shape[1]):
+            if self._gms_qdxs[i,0] < self._gms_qdxs[i,1]:
+                rdx = rng.integers(self._gms_qdxs[i,0],
+                                self._gms_qdxs[i,1]
+                                )
+            else:
+                rdx = self._gms_qdxs[i,0]
+            mock_spectrum[i] = self.fluxmat_sorted[rdx,i]
+
+        return mock_spectrum
+    
     ###############################################################################################
     def _get_fits_info(self,
                        fitsfile
@@ -231,6 +497,146 @@ class sdsscat:
 
         return photometry_table[broad_band_mask]['Frequency', 'Flux Density', 'Upper limit of uncertainty', 'Lower limit of uncertainty']
 
+
+    ###############################################################################################
+    def _ned_photometry_sample(self,
+                               ntabs = 0
+                               ):
+
+        flambda_unit = u.erg / u.cm**2 / u.s / u.Angstrom
+        fefu = 1.0e-15 * flambda_unit
+        sdssfu = 0.01 * fefu
+        hc = (const.h * const.c).to(u.eV * u.nm).value
+
+        qunique, quidx = np.unique(self.qnum,
+                                   return_index=True
+                                   )
+
+        energy_range = np.zeros((2,qunique.size)) * u.eV
+
+        if not os.path.exists(self.mypars.basedir+"/NED_photometry"):
+            os.mkdir(self.mypars.basedir+"/NED_photometry")
+        for i in tqdm(range(quidx.size), ncols=0, desc="\t"*ntabs+"Fetching NED photometry"):
+            qskycoord = SkyCoord(self.ra[quidx[i]] * u.deg,
+                                 self.dec[quidx[i]] * u.deg
+                                 )
+            nedphotfile = self.mypars.basedir+f"/NED_photometry/{self.fileroot[quidx[i]]}.fits"
+            if os.path.exists(nedphotfile):
+                photometry_table = Table.read(nedphotfile,
+                                              format='fits'
+                                              )
+            else:
+                photometry_table = self._ned_photometry(qskycoord)
+                if 'description' in photometry_table.meta:
+                    del photometry_table.meta['description']
+                photometry_table.write(nedphotfile,
+                                       format="fits"
+                                       )
+
+            energy_range[:,i] = np.array([(const.h * np.min(photometry_table['Frequency']) * u.Hz).to(u.eV).value,
+                                          (const.h * np.max(photometry_table['Frequency']) * u.Hz).to(u.eV).value
+                                          ]) * u.eV
+
+            fig = plt.gcf()
+            fig.clf()
+            axs = fig.add_subplot(1,1,1)
+            non_zero_mask = energy_range[0,:] > 0
+            axs.step(np.sort(energy_range[0,non_zero_mask]),
+                     np.arange(np.sum(non_zero_mask))
+                     )
+            non_zero_mask = energy_range[1,:] > 0
+            axs.step(np.sort(energy_range[1,non_zero_mask]),
+                     np.arange(np.sum(non_zero_mask), 0, -1)
+                     )
+
+            xlo = np.min(energy_range[0,:])
+            xhi = np.max(energy_range[1,:])
+
+            energy_radio = (const.h * (5 * u.GHz)).to(u.eV)
+            energy_xray  = 2000 * u.eV
+
+            (ylo,yhi) = axs.get_ylim()
+            for e in [energy_radio,energy_xray]:
+                if (e > xlo) & (e < xhi):
+                    axs.plot([e.value,e.value],
+                             [ylo,yhi],
+                             'k--'
+                             )
+                    axs.text(e.value * 1.0001,
+                             ylo + 0.1*(yhi-ylo),
+                             f"{e:.2e}",
+                             rotation=90)
+
+
+            axs.set_xscale("log")
+            axs.set_xlabel("Energy (eV)")
+            secaxs = axs.secondary_xaxis('top',
+                                         functions=(lambda e: hc / e,
+                                                    lambda w: hc / w
+                                                    )
+                                         )
+            secaxs.set_xlabel('Wavelength [nm]')
+            plt.show(block=False)
+            plt.pause(0.01)
+
+            #non_zero_mask = self.fluxmat[i,:] > 0
+
+            #if np.sum(non_zero_mask) > 0:
+                #lumdist = FlatLambdaCDM(H0=70,
+                #                        Om0=0.3
+                #                        ).luminosity_distance(self.zqso[quidx[i]]).to(u.cm)
+                #photo_restwave = photometry_table['Frequency'].to(u.Angstrom, equivalencies=u.spectral())  / (1 + self.zqso[quidx[i]])
+                #photo_nuFnu = photometry_table['Flux Density'].to(u.erg/u.cm**2/u.s/u.Hz) * photometry_table['Frequency']
+                #photo_Flambda = (photometry_table['Flux Density'].to(u.erg/u.cm**2/u.s/u.Hz) * photometry_table['Frequency'] * photometry_table['Frequency'] / const.c.cgs).to(flambda_unit)
+                #ned_mask = (photo_restwave > np.min(self.rest_wavelength[non_zero_mask])) & \
+                #           (photo_restwave < np.max(self.rest_wavelength[non_zero_mask]))
+                #scales = photo_Flambda[ned_mask] / np.interp(photo_restwave[ned_mask], self.rest_wavelength[non_zero_mask], self.fluxmat[i,non_zero_mask])
+                #avg_scale = np.average(scales)
+
+                #plt.clf()
+                #plt.title(f"{self.fileroot[quidx[i]]}")
+                #plt.xscale("log")
+                #plt.yscale("log")
+                #plt.xlabel("Energy (eV)")
+                #plt.ylabel("Luminosity (erg/s)")
+
+                # Plot SDSS spectrum
+                #plt.step((const.h * const.c / self.rest_wavelength[non_zero_mask]).to(u.eV),
+                #         avg_scale * self.fluxmat[i,non_zero_mask] * self.rest_wavelength[non_zero_mask] * (1 + self.zqso[quidx[i]]) * 4 * np.pi * lumdist**2
+                #         )
+
+                # Plot NED photometry
+                #plt.scatter((const.h * const.c / photo_restwave[ned_mask]).to(u.eV),
+                #            photo_nuFnu[ned_mask] * 4 * np.pi * lumdist**2,
+                #            c='r'
+                #            )
+                #plt.scatter((const.h * const.c / photo_restwave[~ned_mask]).to(u.eV),
+                #            photo_nuFnu[~ned_mask] * 4 * np.pi * lumdist**2,
+                #            c='g'
+                #            )
+
+                #xlo = np.min((const.h * const.c / photo_restwave[~ned_mask]).to(u.eV))
+                #xhi = np.max((const.h * const.c / photo_restwave[~ned_mask]).to(u.eV))
+
+                #energy_radio = (const.h * (5 * u.GHz)).to(u.eV)
+                #energy_xray  = 2000 * u.eV
+
+                #(ylo,yhi) = plt.ylim()
+                #for e in [energy_radio,energy_xray]:
+                #    if (e > xlo) & (e < xhi):
+                #        plt.plot([e.value,e.value],
+                #                 [ylo,yhi],
+                #                 'k--'
+                #                 )
+                #        plt.text(e.value * 1.0001,
+                #                 ylo + 0.1*(yhi-ylo),
+                #                 f"{e:.2e}",
+                #                 rotation=90)
+
+                #plt.show(block=False)
+                #plt.pause(0.001)
+
+
     ###############################################################################################
     def _plot_dist(self):
         fig = plt.gcf()
@@ -256,6 +662,27 @@ class sdsscat:
                  "g--")
         plt.show(block=False)
         plt.pause(0.001)
+
+    ###############################################################################################
+    def _random_sdss_sample(self,
+                            idx = 0,
+                            ntabs = 0
+                            ):
+
+        random_sample = np.zeros_like(self.fluxmat)
+
+        #fig = plt.gcf()
+        for i in tqdm(range(self.fluxmat.shape[0]), ncols=0, desc="\t"*ntabs+f"Generating mock sample {idx}"):
+            random_sample[i,:] = self._generate_mock_sdss()
+            #fig.clf()
+            #axs = fig.add_subplot(1,1,1)
+            #axs.step(self.rest_wavelength,
+            #         random_sample[i,:]
+            #         )
+            #plt.show(block=False)
+            #plt.pause(0.1)
+
+        return random_sample
 
     ###############################################################################################
     def _read_sample(self,
@@ -294,6 +721,7 @@ class sdsscat:
         return speclist
 
     ###############################################################################################
+    # The shape of self.fluxmat will be (number of quasars, number of wavelength bins)
     def _the_matrix(self,
                     speclist,
                     ntabs = 0
@@ -307,14 +735,18 @@ class sdsscat:
         ax.set_axis_on()
         plt.ion()
 
-        rest_wavelength = np.array([])
+        rest_wavelength = np.array([]) * u.Angstrom
         for spec in tqdm(speclist, ncols=0, desc="\t"*ntabs+"Entering The Matrix"):
             if rest_wavelength.size == 0:
                 rest_wavelength = np.copy(spec.rest_wavelength)
                 nqso = np.ones(rest_wavelength.size)
                 fluxmat = np.copy(spec.flux)
+                ivarmat = np.copy(spec.ivar)
             else:
                 fluxmat = np.vstack((fluxmat, 
+                                        np.zeros(rest_wavelength.size))
+                                    )
+                ivarmat = np.vstack((ivarmat, 
                                         np.zeros(rest_wavelength.size))
                                     )
                 between_mask = (rest_wavelength > np.min(spec.rest_wavelength)) & \
@@ -323,6 +755,10 @@ class sdsscat:
                 fluxmat[-1,between_mask] = np.interp(rest_wavelength[between_mask],
                                                         spec.rest_wavelength,
                                                         spec.flux
+                                                        )
+                ivarmat[-1,between_mask] = np.interp(rest_wavelength[between_mask],
+                                                        spec.rest_wavelength,
+                                                        spec.ivar
                                                         )
 
                 prepend_mask = spec.rest_wavelength < np.min(rest_wavelength)
@@ -337,17 +773,32 @@ class sdsscat:
                                         fluxmat,
                                         axis=1
                                         )
+                    ivarmat = np.append(np.zeros((ivarmat.shape[0],
+                                                    np.sum(prepend_mask)
+                                                    )),
+                                        ivarmat,
+                                        axis=1
+                                        )
+
                     fluxmat[-1,:np.sum(prepend_mask)] = np.copy(spec.flux[prepend_mask])
+                    ivarmat[-1,:np.sum(prepend_mask)] = np.copy(spec.ivar[prepend_mask])
                 if np.sum(append_mask):
                     rest_wavelength = np.append(rest_wavelength, spec.rest_wavelength[append_mask])
                     nqso = np.append(nqso, np.ones(np.sum(append_mask)))
                     fluxmat = np.append(fluxmat,
                                         np.zeros((fluxmat.shape[0],
-                                                    np.sum(append_mask),
-                                                    )),
+                                                  np.sum(append_mask),
+                                                  )),
+                                        axis=1
+                                        )
+                    ivarmat = np.append(ivarmat,
+                                        np.zeros((ivarmat.shape[0],
+                                                  np.sum(append_mask),
+                                                  )),
                                         axis=1
                                         )
                     fluxmat[-1,-np.sum(append_mask):] = np.copy(spec.flux[append_mask])
+                    ivarmat[-1,-np.sum(append_mask):] = np.copy(spec.ivar[append_mask])
 
                 ax.cla()
                 ax.step(rest_wavelength,
@@ -356,7 +807,7 @@ class sdsscat:
                         fluxmat[-1,:] * np.max(nqso) / np.max(fluxmat[-1,:]))
                 plt.pause(0.001)
 
-        return rest_wavelength,fluxmat
+        return rest_wavelength,fluxmat,ivarmat
 
     ###############################################################################################
     def _write_sample(self,

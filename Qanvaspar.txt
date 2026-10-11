@@ -1,3 +1,11 @@
 basedir = "/mnt/data/QANVAS_data"
 verbose = True
-nsamp = 500
+nsamp = 1000
+snr1300min = 5.0
+ned_photometry = False
+sdss_composite = False
+#######################
+# Clustering parameters
+clustering = True
+cluster_nsigma = 3.0
+cluster_tol = 1.0e-3
