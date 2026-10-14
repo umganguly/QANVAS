@@ -140,84 +140,82 @@ class sdsscat:
                    distance_threshold=0
                    ).fit(new_fluxmat/self.sdssfu)
 
-        old_distance_average = np.zeros(new_fluxmat.shape[0]-1)
-        nit = 0
-        num_groups = 5
-        done = False
-        while not done:
-            nit += 1
-            random_sample = self._random_sdss_sample(idx = nit,
-                                                     ntabs = ntabs+1
-                                                     )
-            random_model = AG(n_clusters=None,
-                            distance_threshold=0
-                            ).fit(random_sample/self.sdssfu)
-            try:
-                rand_distance_array = np.vstack((rand_distance_array, 
-                                                random_model.distances_
-                                                ))
-            except:
-                rand_distance_array = np.copy(random_model.distances_)
+        # If the collection of random mock catalogs have already been made (and been written to file), then read them in.
+        random_mock_file = self.mypars.basedir+f"/qanvas_randomspecmat_n{self.mypars.nsamp}_sn{self.mypars.snr1300min}.fits"
+        if os.path.exists(random_mock_file):
+            with fits.open(random_mock_file) as hdul:
+              rand_distance_average = hdul[1].data['rand_distance_average']
+              rand_distance_stddev  = hdul[1].data['rand_distance_stddev']
+              breaking_distance     = float(hdul[1].header['TEMPERAT'] )
+        
+        else:
+            old_distance_average = np.zeros(new_fluxmat.shape[0]-1)
+            nit = 0
+            num_groups = 5
+            done = False
+            while not done:
+                nit += 1
+                random_sample = self._random_sdss_sample(idx = nit,
+                                                        ntabs = ntabs+1
+                                                        )
+                random_model = AG(n_clusters=None,
+                                distance_threshold=0
+                                ).fit(random_sample/self.sdssfu)
+                try:
+                    rand_distance_array = np.vstack((rand_distance_array, 
+                                                    random_model.distances_
+                                                    ))
+                except:
+                    rand_distance_array = np.copy(random_model.distances_)
 
-            rand_distance_average = np.average(rand_distance_array,
+                rand_distance_average = np.average(rand_distance_array,
+                                                    axis = 0
+                                                    )
+                rand_distance_stddev  = np.std(rand_distance_array,
                                                 axis = 0
                                                 )
-            rand_distance_stddev  = np.std(rand_distance_array,
-                                            axis = 0
-                                            )
 
-            # Better idea than this... we should do a root find on the interpolation of f(x) = model.distances_ - random_model.distances_
-            breaking_point = model.distances_ > rand_distance_average + self.mypars.cluster_nsigma * rand_distance_stddev
-            res = root(fun=lambda x: np.interp(x, 
-                                                np.arange(model.distances_.size), 
-                                                model.distances_ - (random_model.distances_ + self.mypars.cluster_nsigma * rand_distance_stddev)
-                                                ),
-                        x0 = np.min(model.distances_[breaking_point])
-                        )
-            if res.success:
-                breaking_distance = np.interp(res.x, 
-                                                np.arange(model.distances_.size), 
-                                                model.distances_
-                                                )[0]
-            else:
-                breaking_distance = np.min(model.distances_[breaking_point])
+                fracerr = np.fabs(rand_distance_average-old_distance_average)/(old_distance_average+sys.float_info.epsilon)
+                if np.all(fracerr < self.mypars.cluster_tol):
+                    done = True
+                else:
+                    old_distance_average = rand_distance_average
+                    print("\t"*(ntabs+1) + f"Haven't coverged yet: {np.max(fracerr):e} {np.sum(fracerr >= self.mypars.cluster_tol)}")
 
-            num_groups = 1 + np.sum(model.distances_ > breaking_distance)
+            # Need to write the random_mock_file...
+            rand_table = Table(data=[rand_distance_average, rand_distance_stddev],
+                               names = ['rand_distance_average', 'rand_distance_stddev']
+                               )
+            rand_table.write(random_mock_file,
+                             format = 'fits')
 
-            fracerr = np.fabs(rand_distance_average-old_distance_average)/(old_distance_average+sys.float_info.epsilon)
-            if np.all(fracerr < self.mypars.cluster_tol):
-                done = True
-            else:
-                old_distance_average = rand_distance_average
-                print("\t"*(ntabs+1) + f"Haven't coverged yet: {np.max(fracerr):e} {np.sum(fracerr >= self.mypars.cluster_tol)} {breaking_distance} {num_groups}")
 
-            if nit % num_groups == num_groups-1:
-                plt.clf()
-                plt.subplot(211)
-                plt.title(f"{nit}: {num_groups}")
-                self._clustering_plot_linkage_distance(model,
-                                                       rand_distance_average,
-                                                       rand_distance_stddev,
-                                                       breaking_distance
-                                                       )
+        breaking_point = model.distances_ > rand_distance_average + self.mypars.cluster_nsigma * rand_distance_stddev
+        res = root(fun=lambda x: np.interp(x, 
+                                            np.arange(model.distances_.size), 
+                                            model.distances_ - (random_model.distances_ + self.mypars.cluster_nsigma * rand_distance_stddev)
+                                            ),
+                    x0 = np.min(model.distances_[breaking_point])
+                    )
+        if res.success:
+            breaking_distance = np.interp(res.x, 
+                                            np.arange(model.distances_.size), 
+                                            model.distances_
+                                            )[0]
+        else:
+            breaking_distance = np.min(model.distances_[breaking_point])
 
-                plt.subplot(212)
-                self._clustering_plot_dendrogram(model, 
-                                                truncate_mode="level", 
-                                                p=p
-                                                )
-                xlo,xhi = plt.xlim()
-                plt.plot([xlo,xhi],
-                        [breaking_distance,breaking_distance],
-                        'k--'
-                        )
-                plt.xlabel("Number of quasars in node (or index of quasar if no parenthesis).")
-                plt.ylabel("Linkage Distance")
-
-                plt.show(block=False)
-                plt.pause(0.01)
+        num_groups = 1 + np.sum(model.distances_ > breaking_distance)
 
         plt.clf()
+        #plt.subplot(211)
+        #plt.title(f"{nit}: {num_groups}")
+        #self._clustering_plot_linkage_distance(model,
+        #                                        rand_distance_average,
+        #                                        rand_distance_stddev,
+        #                                        breaking_distance
+        #                                        )
+
         plt.subplot(211)
         self._clustering_plot_dendrogram(model, 
                                         truncate_mode="level", 
@@ -724,16 +722,18 @@ class sdsscat:
     # The shape of self.fluxmat will be (number of quasars, number of wavelength bins)
     def _the_matrix(self,
                     speclist,
-                    ntabs = 0
+                    ntabs = 0,
+                    plotspec = False
                     ):
-        fig = plt.gcf()
-        plt.ion()
-        fig.clf()
-        for ax in fig.get_axes():
-            ax.remove()
-        ax = fig.add_axes((0.125, 0.1, 0.775, 0.8))
-        ax.set_axis_on()
-        plt.ion()
+        if plotspec:
+            fig = plt.gcf()
+            plt.ion()
+            fig.clf()
+            for ax in fig.get_axes():
+                ax.remove()
+            ax = fig.add_axes((0.125, 0.1, 0.775, 0.8))
+            ax.set_axis_on()
+            plt.ion()
 
         rest_wavelength = np.array([]) * u.Angstrom
         for spec in tqdm(speclist, ncols=0, desc="\t"*ntabs+"Entering The Matrix"):
@@ -800,12 +800,13 @@ class sdsscat:
                     fluxmat[-1,-np.sum(append_mask):] = np.copy(spec.flux[append_mask])
                     ivarmat[-1,-np.sum(append_mask):] = np.copy(spec.ivar[append_mask])
 
-                ax.cla()
-                ax.step(rest_wavelength,
-                        nqso)
-                ax.step(rest_wavelength,
-                        fluxmat[-1,:] * np.max(nqso) / np.max(fluxmat[-1,:]))
-                plt.pause(0.001)
+                if plotspec:
+                    ax.cla()
+                    ax.step(rest_wavelength,
+                            nqso)
+                    ax.step(rest_wavelength,
+                            fluxmat[-1,:] * np.max(nqso) / np.max(fluxmat[-1,:]))
+                    plt.pause(0.001)
 
         return rest_wavelength,fluxmat,ivarmat
 

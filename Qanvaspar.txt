@@ -1,6 +1,6 @@
 basedir = "/mnt/data/QANVAS_data"
 verbose = True
-nsamp = 1000
+nsamp = 300
 snr1300min = 5.0
 ned_photometry = False
 sdss_composite = False
