@@ -1,5 +1,8 @@
 import numpy as np
 
+from astropy                 import constants               as const
+
+
 ###############################################################################################
 # Returns an (nwave,nref) array with velocities
 def calcvel(waveall,
@@ -9,7 +12,7 @@ def calcvel(waveall,
     nwave = waveall.size
     wsq   = np.square(np.transpose(np.broadcast_to(waveall, (nref,nwave))) /
                       np.broadcast_to(waveref, (nwave,nref)))
-    return 299792.458 * (wsq - 1.0) / (wsq + 1.0)
+    return const.c * (wsq - 1.0) / (wsq + 1.0)
 
 ###############################################################################################
 def calcvelzz(z1,
@@ -17,7 +20,7 @@ def calcvelzz(z1,
               ):
     z1p1 = z1+1
     z2p1 = z2+1
-    return 299792.458 * (z1p1*z1p1 - z2p1*z2p1)/(z1p1*z1p1 + z2p1*z2p1)
+    return const.c * (z1p1*z1p1 - z2p1*z2p1)/(z1p1*z1p1 + z2p1*z2p1)
 
 ###############################################################################################
 # Returns an (nvel,nwave) array with observed wavelengths
@@ -26,7 +29,7 @@ def calcwave(velocity,
              ):
     nvel = velocity.size
     nwave = waveref.size
-    beta = np.copy(velocity)/299792.458
+    beta = (velocity/const.c).decompose()
     wsq = (1 + beta)/(1 - beta)
 
     bwaveref = np.broadcast_to(waveref,      (nvel,nwave))
