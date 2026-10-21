@@ -11,6 +11,7 @@ from scipy.cluster.hierarchy import dendrogram
 #from scipy.optimize          import leastsq
 from scipy.optimize          import root
 from astropy                 import constants               as const
+from astropy.convolution     import Box1DKernel, Gaussian1DKernel, convolve
 from astropy.coordinates     import SkyCoord
 from astropy                 import units                   as u
 from astropy.io              import fits
@@ -18,12 +19,13 @@ from astropy.io              import fits
 from astropy.table           import Table
 from astropy.cosmology       import FlatLambdaCDM
 from astroquery.ipac.ned     import Ned
-#from sklearn.decomposition   import NMF
+from multiprocessing         import Pool
 from sklearn.cluster         import AgglomerativeClustering as AG
+from sklearn.decomposition   import NMF
 from tqdm                    import tqdm
 
-#from doppler                 import calcvel, calcwave
-#from atomic                  import atomic
+from doppler                 import calcvel
+from atomic                  import atomic
 from spectrum                import spectrum
 
 
@@ -69,7 +71,8 @@ class sdsscat:
         self._read_sample(samplefile1,
                           ntabs = ntabs+1
                           )
-        print("\t"*ntabs + f"Sample has {np.unique(self.qnum).size} unique objects out of {self.qnum.size}")
+        qunique,self.qundx = np.unique(self.qnum, return_index=True)
+        print("\t"*ntabs + f"Sample has {qunique.size} unique objects out of {self.qnum.size}")
 
         print("\t"*ntabs + f"Looking for {specmatfile}")
         if not os.path.exists(specmatfile):
@@ -105,21 +108,290 @@ class sdsscat:
                 print("\t"*ntabs + f"Filtering spectra down to {np.sum(snr1300_mask)} with S/N_1300 > {self.mypars.snr1300min}")
                 self.fluxmat = self.fluxmat[snr1300_mask,:]
                 self.ivarmat = self.ivarmat[snr1300_mask,:]
+                self.snr1300_qundx = self.qundx[snr1300_mask]
 
-        if self.mypars.ned_photometry:
-            self._ned_photometry_sample(ntabs = ntabs+1)
-
-        if self.mypars.sdss_composite or self.mypars.clustering:
+        if self.mypars.sdss_composite or self.mypars.clustering or self.mypars.object_filter.size > 0:
             self.composite_flux = self._composite_spectrum(np.arange(self.fluxmat.shape[0],
                                                                      dtype = np.int16
                                                                      ),
                                                            ntabs = ntabs+1
                                                            )
 
+        for odx in self.mypars.object_filter:
+            if odx < self.fluxmat.shape[0]:
+                self.fluxmat[odx,:] = self.composite_flux
+                self.ivarmat[odx,:] = np.zeros(self.composite_flux.shape) * 1/self.sdssfu**2
+
+        if self.mypars.ned_photometry:
+            self._ned_photometry_sample(ntabs = ntabs+1)
+
         if self.mypars.clustering:
             self._clustering(ntabs = ntabs+1)
 
+        if self.mypars.nmf:
+            self._nmf(ntabs = ntabs+1)
+
+        if self.mypars.abscat:
+            try:
+                whi = np.max(self.rest_wavelength * (1.0 + np.max(self.zqso[snr1300_mask])))
+            except:
+                whi = np.max(self.rest_wavelength * (1.0 + np.max(self.zqso)))
+
+            self.myatoms = atomic(self.mypars.basedir,
+                                  np.min(self.rest_wavelength),
+                                  whi,
+                                  minlox=9.9,
+                                  ntabs = ntabs+1
+                                  )
+
+            self._abscat(ntabs = ntabs+1)
+
         input("paused")
+
+    ###############################################################################################
+    def _abscat(self,
+                ntabs = 0
+                ):
+        #for spdx in tqdm(range(self.fluxmat.shape[0]), ncols=0, desc="\t"*ntabs + "Assmebling absorption catalog")
+        spdx = 9
+        normflux, normferr = self._nmf_normspec(spdx,
+                                                ntabs = ntabs+1
+                                                )
+        ew, sew, EW, SEW = self.calcew(self.rest_wavelength[self._nmf_wave_mask],
+                                       normflux,
+                                       normferr,
+                                       const.c/self.mypars.R
+                                       )
+
+        velocity, ewbin, sewbin = self._abs_stack_ions(EW,
+                                                       SEW,
+                                                       ntabs = ntabs+1
+                                                       )
+
+        significance = ewbin/(sewbin + sys.float_info.epsilon)
+        vabs = np.array([]) * (u.km/u.s)
+        vlo  = np.array([]) * (u.km/u.s)
+        vhi  = np.array([]) * (u.km/u.s)
+        while np.max(significance) > 3.0:
+            flat_idx = np.argmax(significance) 
+            ipbin, vbin = np.unravel_index(flat_idx, significance.shape)
+            vabs = np.append(vabs, velocity[vbin])
+
+            vdxlo = np.copy(vbin)
+            while significance[ipbin,vdxlo] > 0:
+                vdxlo -= 1
+            vlo = np.append(vlo, velocity[vdxlo])
+            vdxhi = np.copy(vbin)
+            while significance[ipbin,vdxhi] > 0:
+                vdxhi += 1
+            vhi = np.append(vhi, velocity[vdxhi])
+
+            significance[:,vdxlo:vdxhi] = 0.0
+
+            print("\t"*ntabs + f"{vabs[-1]:6.1f} {vlo[-1]:6.1f} {vhi[-1]:6.1f} {ipbin}")
+
+        line_ew_array, line_sew_array = self._abs_line_ew(vlo,
+                                                          vhi,
+                                                          ew,
+                                                          sew,
+                                                          ntabs = ntabs+1
+                                                          )
+
+        self._abs_print_linelist(vabs,
+                                 vlo,
+                                 vhi,
+                                 line_ew_array, 
+                                 line_sew_array,
+                                 ntabs = ntabs+1
+                                 )
+
+        plt.clf()
+        plt.subplot(411)
+        for which_bin in range(ewbin.shape[0]):
+            plt.step(velocity,
+                    ewbin[which_bin,:]/(sewbin[which_bin,:] + sys.float_info.epsilon),
+                    label = f"IP bin {which_bin}"
+                    )
+        ylo,yhi = plt.ylim()
+        plt.plot([velocity[vbin].to(u.km/u.s).value, velocity[vbin].to(u.km/u.s).value],
+                 [ylo,yhi],
+                 "k--"
+                 )
+        plt.legend()
+
+        plt.subplot(412)
+        for which_bin in range(ewbin.shape[0]):
+            plt.step(velocity,
+                    ewbin[which_bin,:],
+                    label = f"IP bin {which_bin}"
+                    )
+        ylo,yhi = plt.ylim()
+        plt.plot([velocity[vbin].to(u.km/u.s).value, velocity[vbin].to(u.km/u.s).value],
+                 [ylo,yhi],
+                 "k--"
+                 )
+        plt.legend()
+        xlo,xhi = plt.xlim()
+
+        civvel = calcvel(self.rest_wavelength[self._nmf_wave_mask],
+                          self.myatoms.wave[self.myatoms.getspecies(6,4)]
+                          ).to(u.km/u.s)
+        nvvel = calcvel(self.rest_wavelength[self._nmf_wave_mask],
+                        self.myatoms.wave[self.myatoms.getspecies(7,5)]
+                        ).to(u.km/u.s)
+        hivel = calcvel(self.rest_wavelength[self._nmf_wave_mask],
+                        self.myatoms.wave[self.myatoms.getspecies(1,1)]
+                        ).to(u.km/u.s)
+
+        plt.subplot(413)
+
+        plt.step(hivel[:,0],
+                 normflux,
+                 label = "H I"
+                 )
+
+        plt.step(civvel[:,0],
+                 normflux,
+                 label = "C IVb"
+                 )
+        plt.step(civvel[:,1],
+                 normflux,
+                 label = "C IVr"
+                 )
+
+        plt.step(nvvel[:,0],
+                 normflux,
+                 label = "N Vb"
+                 )
+        plt.step(nvvel[:,1],
+                 normflux,
+                 label = "N Vr"
+                 )
+
+        ylo,yhi = plt.ylim()
+        plt.plot([velocity[vbin].to(u.km/u.s).value, velocity[vbin].to(u.km/u.s).value],
+                 [ylo,yhi],
+                 "k--"
+                 )
+        plt.legend()
+        plt.xlim([xlo,xhi])
+        plt.ylim([-0.2,1.4])
+        print(f"v(CIV) = [{np.min(civvel)},{np.max(civvel)}].... I/I_0 = [{np.min(normflux)},{np.max(normflux)}]")
+
+        plt.subplot(414)
+        plt.fill_between(civvel[:,0].value,
+                         -SEW.value,
+                         SEW.value,
+                         alpha = 0.5
+                         )
+        plt.step(civvel[:,0],
+                 -EW)
+        ylo,yhi = plt.ylim()
+        plt.plot([velocity[vbin].to(u.km/u.s).value, velocity[vbin].to(u.km/u.s).value],
+                 [ylo,yhi],
+                 "k--"
+                 )
+        plt.xlim([xlo,xhi])
+
+        plt.show(block=False)
+        plt.pause(0.001)
+
+    ###############################################################################################
+    def _abs_line_ew(self,
+                     vlo,
+                     vhi,
+                     ew,
+                     sew,
+                     ntabs = 0
+                     ):
+        line_ew_array  = np.empty((vlo.size,self.myatoms.wave.size)) * u.Angstrom
+        line_sew_array = np.empty((vlo.size,self.myatoms.wave.size)) * u.Angstrom**2
+        for vdx in range(vlo.size):
+            for adx in range(self.myatoms.wave.size):
+                specvel = np.squeeze(calcvel(self.rest_wavelength[self._nmf_wave_mask],
+                                            self.myatoms.wave[adx]
+                                            ).to(u.km/u.s)
+                                    )
+                dspecvel = np.zeros_like(specvel)
+                dspecvel[1:-1] = 0.5 * (specvel[2:] - specvel[:-2])
+                dspecvel[ 0] = dspecvel[ 1]
+                dspecvel[-1] = dspecvel[-2]
+                vel_mask = (specvel + 0.5 * dspecvel > vlo[vdx]) & (specvel - 0.5 * dspecvel < vhi[vdx])
+                if np.sum(vel_mask) > 0:
+                    line_ew_array[ vdx,adx] = np.sum(ew[vel_mask])
+                    line_sew_array[vdx,adx] = np.sum(sew[vel_mask] * sew[vel_mask])
+                    # Edge effects
+                    #ldx = np.min(np.arange(specvel.size, dtype=np.int16)[vel_mask])
+                    #hdx = np.max(np.arange(specvel.size, dtype=np.int16)[vel_mask])
+                    #for (dx,dx0, vr, sgn) in [(ldx-1, ldx, vlo[vdx], -1),
+                    #                          (hdx+1, hdx, vhi[vdx], +1)]:
+                    #    w = np.fabs(specvel[dx0] + sgn * 0.5 * dspecvel[dx0] - vr)/dspecvel[dx]
+                    #    line_ew_array[ vdx,adx] += ew[dx] * w
+                    #    line_sew_array[vdx,adx] += sew[dx] * sew[dx] * w * w
+        line_sew_array = np.sqrt(line_sew_array)
+
+        return line_ew_array, line_sew_array
+
+    ###############################################################################################
+    def _abs_print_linelist(self,
+                            vabs,
+                            vlo,
+                            vhi,
+                            line_ew_array, 
+                            line_sew_array,
+                            ntabs = 0
+                            ):
+        print("\t"*ntabs + "    vabs      vlo      vhi EW(HI)    EW(NVb)   EW(NVr)   EW(CIVb)  EW(CIVr)")
+        for vdx in np.argsort(vabs):
+            prtstr = f"{vabs[vdx].to(u.km/u.s).value:>8.1f} {vlo[vdx].to(u.km/u.s).value:>8.1f} {vhi[vdx].to(u.km/u.s).value:>8.1f}"
+
+            adx = self.myatoms.getspecies(1,1)
+            prtstr += f" {line_ew_array[vdx,adx[0]].to(u.mAngstrom).value:>4.0f} {line_sew_array[vdx,adx[0]].to(u.mAngstrom).value:>4.0f}"
+
+            adx = self.myatoms.getspecies(7,5)
+            prtstr += f" {line_ew_array[vdx,adx[0]].to(u.mAngstrom).value:>4.0f} {line_sew_array[vdx,adx[0]].to(u.mAngstrom).value:>4.0f}"
+            prtstr += f" {line_ew_array[vdx,adx[1]].to(u.mAngstrom).value:>4.0f} {line_sew_array[vdx,adx[1]].to(u.mAngstrom).value:>4.0f}"
+
+            adx = self.myatoms.getspecies(6,4)
+            prtstr += f" {line_ew_array[vdx,adx[0]].to(u.mAngstrom).value:>4.0f} {line_sew_array[vdx,adx[0]].to(u.mAngstrom).value:>4.0f}"
+            prtstr += f" {line_ew_array[vdx,adx[1]].to(u.mAngstrom).value:>4.0f} {line_sew_array[vdx,adx[1]].to(u.mAngstrom).value:>4.0f}"
+
+            print("\t"*ntabs + prtstr)
+
+    ###############################################################################################
+    def _abs_stack_ions(self,
+                        EW,
+                        SEW,
+                        ntabs = 0
+                        ):
+        velocity = np.linspace(self.mypars.abs_vlo.to(u.km/u.s).value,
+                               self.mypars.abs_vhi.to(u.km/u.s).value,
+                               num = np.int16( ( (self.mypars.abs_vhi-self.mypars.abs_vlo)/(u.km/u.s) ).decompose() )
+                               ) * (u.km/u.s)
+        ewbin = np.zeros((self.mypars.lohiip.size+1,velocity.size))
+        sewbin = np.zeros((self.mypars.lohiip.size+1,velocity.size))
+        for adx in range(self.myatoms.wave.size):
+            specvel = np.squeeze(calcvel(self.rest_wavelength[self._nmf_wave_mask],
+                                         self.myatoms.wave[adx]
+                                         ).to(u.km/u.s)
+                                 )
+            which_bin = np.sum(self.mypars.lohiip * u.eV < self.myatoms.ip[adx])
+            ewbin[which_bin,:] += np.interp(velocity.value,
+                                            specvel.value,
+                                            EW.value*self.myatoms.lox[adx],
+                                            left=0,
+                                            right=0
+                                            )
+            sewbin[which_bin,:] += np.interp(velocity.value,
+                                             specvel.value,
+                                             SEW.value*SEW.value*self.myatoms.lox[adx]*self.myatoms.lox[adx],
+                                             left=0,
+                                             right=0
+                                             )
+        sewbin = np.sqrt(sewbin)
+
+
+        return velocity, ewbin, sewbin
 
     ###############################################################################################
     def _clustering(self,
@@ -127,18 +399,19 @@ class sdsscat:
                     ntabs = 0
                     ):
 
-        #qmask = np.arange(self.fluxmat.shape[0], dtype=np.int16) != 73
-        #self.fluxmat = self.fluxmat[qmask,:]
+        plt.gcf()
+        plt.ion()
 
         new_fluxmat = np.copy(self.fluxmat)
+
         for i in tqdm(range(new_fluxmat.shape[1]), ncols=0, desc="\t"*ntabs + f"Substituting composite flux in fluxmat"):
             zero_mask = new_fluxmat[:,i] < sys.float_info.epsilon * self.sdssfu
             if np.sum(zero_mask) > 0:
                 new_fluxmat[zero_mask,i] = self.composite_flux[i]
 
-        model = AG(n_clusters=None,
-                   distance_threshold=0
-                   ).fit(new_fluxmat/self.sdssfu)
+        self._cluster_model = AG(n_clusters=None,
+                                 distance_threshold=0
+                                 ).fit(new_fluxmat/self.sdssfu)
 
         # If the collection of random mock catalogs have already been made (and been written to file), then read them in.
         random_mock_file = self.mypars.basedir+f"/qanvas_randomspecmat_n{self.mypars.nsamp}_sn{self.mypars.snr1300min}.fits"
@@ -146,8 +419,8 @@ class sdsscat:
             with fits.open(random_mock_file) as hdul:
               rand_distance_average = hdul[1].data['rand_distance_average']
               rand_distance_stddev  = hdul[1].data['rand_distance_stddev']
-              breaking_distance     = float(hdul[1].header['TEMPERAT'] )
-        
+              breaking_distance     = float(hdul[1].header['BREAKD'] )
+
         else:
             old_distance_average = np.zeros(new_fluxmat.shape[0]-1)
             nit = 0
@@ -168,12 +441,23 @@ class sdsscat:
                 except:
                     rand_distance_array = np.copy(random_model.distances_)
 
-                rand_distance_average = np.average(rand_distance_array,
+                if len(rand_distance_array.shape) > 1:
+                    rand_distance_average = np.average(rand_distance_array,
+                                                        axis = 0
+                                                        )
+                    rand_distance_stddev  = np.std(rand_distance_array,
                                                     axis = 0
                                                     )
-                rand_distance_stddev  = np.std(rand_distance_array,
-                                                axis = 0
-                                                )
+                else:
+                    rand_distance_average = np.copy(rand_distance_array)
+                    rand_distance_stddev  = np.zeros_like(rand_distance_array)
+
+
+                breaking_distance = self._clustering_breaking_distance(self._cluster_model,
+                                                                    rand_distance_average,
+                                                                    rand_distance_stddev
+                                                                    )
+                num_groups = 1 + np.sum(self._cluster_model.distances_ > breaking_distance)
 
                 fracerr = np.fabs(rand_distance_average-old_distance_average)/(old_distance_average+sys.float_info.epsilon)
                 if np.all(fracerr < self.mypars.cluster_tol):
@@ -182,18 +466,125 @@ class sdsscat:
                     old_distance_average = rand_distance_average
                     print("\t"*(ntabs+1) + f"Haven't coverged yet: {np.max(fracerr):e} {np.sum(fracerr >= self.mypars.cluster_tol)}")
 
+                plt.clf()
+                plt.subplot(212)
+                plt.title(f"{nit}: {num_groups}")
+                self._clustering_plot_linkage_distance(self._cluster_model,
+                                                        rand_distance_average,
+                                                        rand_distance_stddev,
+                                                        breaking_distance
+                                                        )
+
+                plt.subplot(211)
+                self._clustering_plot_dendrogram(self._cluster_model, 
+                                                 breaking_distance,
+                                                 truncate_mode="level", 
+                                                 p=p
+                                                 )
+                plt.show(block=False)
+                plt.pause(0.001)
+
             # Need to write the random_mock_file...
             rand_table = Table(data=[rand_distance_average, rand_distance_stddev],
                                names = ['rand_distance_average', 'rand_distance_stddev']
                                )
-            rand_table.write(random_mock_file,
-                             format = 'fits')
+            hdu = fits.table_to_hdu(rand_table)
+            hdu.header['BREAKD'] = breaking_distance
+            hdu.writeto(random_mock_file,
+                        overwrite = True
+                        )
 
+        breaking_distance = self._clustering_breaking_distance(self._cluster_model,
+                                                               rand_distance_average,
+                                                               rand_distance_stddev
+                                                               )
 
+        num_groups = 1 + np.sum(self._cluster_model.distances_ > breaking_distance)
+
+        plt.clf()
+        plt.subplot(211)
+        self._clustering_plot_dendrogram(self._cluster_model, 
+                                         breaking_distance,
+                                         truncate_mode="level", 
+                                         p=p
+                                         )
+        xlo,xhi = plt.xlim()
+        plt.plot([xlo,xhi],
+                [breaking_distance,breaking_distance],
+                'k--'
+                )
+        plt.xlabel("Number of quasars in node (or index of quasar if no parenthesis).")
+        plt.ylabel("Linkage Distance")
+
+        plt.subplot(212)
+        self._clustering_plot_comps(breaking_distance,
+                                    ntabs = ntabs+1
+                                    )
+
+        plt.show(block=False)
+        plt.pause(0.01)
+
+    ###############################################################################################
+    def _clustering_plot_comps(self,
+                               breaking_distance,
+                               ntabs = 0
+                               ):
+
+        offset = 0
+        fmax = 0
+        bdx = -1
+        bd = self._cluster_model.distances_[bdx] + sys.float_info.epsilon
+        group_list = np.array([])
+        while bd > breaking_distance:
+            num_groups = 1 + np.sum(self._cluster_model.distances_ > bd)
+            print("\t" * (ntabs+1) + f"Grabbing composites for {num_groups} groups with linkage distance < {bd}")
+            wave_mask = ((self.rest_wavelength < 1750 * u.Angstrom) | (self.rest_wavelength > 1802 * u.Angstrom)) & \
+                        ((self.rest_wavelength < 2809 * u.Angstrom) | (self.rest_wavelength > 2959 * u.Angstrom))
+            qdx = self._clustering_find_group_membership(self._cluster_model,
+                                                         bd
+                                                         )
+
+            for group_number in np.unique(qdx):
+                if not np.any(group_list == group_number):
+                    group_list = np.append(group_list,
+                                           group_number
+                                           )
+                    group_members = np.arange(self._cluster_model.distances_.shape[0]+1)[qdx == group_number]
+                    print("\t" * (ntabs+2) + f"Group {group_number} membership: {' '.join(map(str, group_members))}")
+                    if group_members.size > 1:
+                        group_composite = self._composite_spectrum(group_members,
+                                                                ntabs = ntabs+3
+                                                                )
+                    else:
+                        group_composite = np.copy(self.fluxmat[group_number,:])
+                    plt.step(self.rest_wavelength,
+                            group_composite/self.sdssfu + offset,
+                            label = f"{group_number} ({group_members.size})")
+                    if np.max(group_composite[wave_mask]/self.sdssfu) + offset > fmax:
+                        fmax = np.max(group_composite[wave_mask]/self.sdssfu) + offset
+                        print("\t" * (ntabs+2) + f"New fmax = {fmax}")
+                    offset += 2
+
+            if bd > breaking_distance:
+                bdx -= 1
+                bd = self._cluster_model.distances_[bdx] + sys.float_info.epsilon
+                offset += 2
+
+        plt.ylim(top = fmax)
+        plt.xlabel('Rest Wavelenghth [Angstrom]')
+        plt.ylabel('Group Composite Flux')
+        plt.legend(ncols = 1 + num_groups//6)
+
+    ###############################################################################################
+    def _clustering_breaking_distance(self,
+                                      model,
+                                      rand_distance_average,
+                                      rand_distance_stddev
+                                      ):
         breaking_point = model.distances_ > rand_distance_average + self.mypars.cluster_nsigma * rand_distance_stddev
         res = root(fun=lambda x: np.interp(x, 
                                             np.arange(model.distances_.size), 
-                                            model.distances_ - (random_model.distances_ + self.mypars.cluster_nsigma * rand_distance_stddev)
+                                            model.distances_ - (rand_distance_average + self.mypars.cluster_nsigma * rand_distance_stddev)
                                             ),
                     x0 = np.min(model.distances_[breaking_point])
                     )
@@ -205,63 +596,7 @@ class sdsscat:
         else:
             breaking_distance = np.min(model.distances_[breaking_point])
 
-        num_groups = 1 + np.sum(model.distances_ > breaking_distance)
-
-        plt.clf()
-        #plt.subplot(211)
-        #plt.title(f"{nit}: {num_groups}")
-        #self._clustering_plot_linkage_distance(model,
-        #                                        rand_distance_average,
-        #                                        rand_distance_stddev,
-        #                                        breaking_distance
-        #                                        )
-
-        plt.subplot(211)
-        self._clustering_plot_dendrogram(model, 
-                                        truncate_mode="level", 
-                                        p=p
-                                        )
-        xlo,xhi = plt.xlim()
-        plt.plot([xlo,xhi],
-                [breaking_distance,breaking_distance],
-                'k--'
-                )
-        plt.xlabel("Number of quasars in node (or index of quasar if no parenthesis).")
-        plt.ylabel("Linkage Distance")
-
-        plt.subplot(212)
-        print("\t" * (ntabs+1) + f"Grabbing composites for {num_groups} groups with linkage distance < {breaking_distance}")
-        wave_mask = ((self.rest_wavelength < 1750 * u.Angstrom) | (self.rest_wavelength > 1802 * u.Angstrom)) & \
-                    ((self.rest_wavelength < 2809 * u.Angstrom) | (self.rest_wavelength > 2959 * u.Angstrom))
-        qdx = self._clustering_find_group_membership(model,
-                                                        breaking_distance
-                                                        )
-
-        offset = 0
-        fmax = 0
-        for group_number in np.unique(qdx):
-            group_members = np.arange(model.distances_.shape[0]+1)[qdx == group_number]
-            print("\t" * (ntabs+2) + f"Group {group_number} membership: {' '.join(map(str, group_members))}")
-            if group_members.size > 1:
-                group_composite = self._composite_spectrum(group_members,
-                                                        ntabs = ntabs+3
-                                                        )
-            else:
-                group_composite = np.copy(new_fluxmat[group_number,:])
-            plt.step(self.rest_wavelength,
-                    group_composite/self.sdssfu + offset,
-                    label = f"{group_number} ({group_members.size})")
-            if np.max(group_composite[wave_mask]/self.sdssfu) + offset > fmax:
-                fmax = np.max(group_composite[wave_mask]/self.sdssfu) + offset
-                print("\t" * (ntabs+2) + f"New fmax = {fmax}")
-            offset += 2
-        plt.ylim(top = fmax)
-        plt.xlabel('Rest Wavelenghth [Angstrom]')
-        plt.ylabel('Group Composite Flux')
-        plt.legend(ncols = 1 + num_groups//6)
-
-        plt.show(block=False)
-        plt.pause(0.01)
+        return breaking_distance
 
     ###############################################################################################
     def _clustering_find_group_membership(self,
@@ -291,6 +626,7 @@ class sdsscat:
     ###############################################################################################
     def _clustering_plot_dendrogram(self,
                                     model, 
+                                    breaking_distance,
                                     **kwargs
                                     ):
         # create the counts of samples under each node
@@ -310,7 +646,17 @@ class sdsscat:
         ).astype(float)
 
         # Plot the corresponding dendrogram
-        dendrogram(linkage_matrix, **kwargs)
+        dendrogram(linkage_matrix, 
+                   color_threshold=breaking_distance
+                   )
+
+        xlo,xhi = plt.xlim()
+        plt.plot([xlo,xhi],
+                    [breaking_distance,breaking_distance],
+                'k--'
+                )
+        plt.xlabel("Number of quasars in node (or index of quasar if no parenthesis).")
+        plt.ylabel("Linkage Distance")
 
     ###############################################################################################
     def _clustering_plot_linkage_distance(self,
@@ -406,7 +752,7 @@ class sdsscat:
                 self.zqso = np.append(self.zqso, zqso)
 
                 self.qnum = np.arange(self.ra.size,dtype=np.int32)
-                if self.ra.size % 100 == 2:
+                if self.ra.size % self.mypars.plot_freq == 1:
                     self._plot_dist()
                     plt.pause(0.01)
 
@@ -436,12 +782,14 @@ class sdsscat:
     ###############################################################################################
     # The shape of self.fluxmat will be (number of quasars, number of wavelength bins)
     def _generate_mock_sdss(self,
-                            ntabs = 0
+                            ntabs = 0,
+                            dummy = 0
                             ):
 
         try:
             dum = self.fluxmat_sorted[0,0]
         except:
+            print("\t"*ntabs + "Sorting copy of flux matrix...")
             self.fluxmat_sorted = np.copy(self.fluxmat)
             self._gms_qdxs = np.zeros((self.fluxmat.shape[1],2), dtype=np.int16)
             for i in range(self.fluxmat.shape[1]):
@@ -636,6 +984,178 @@ class sdsscat:
 
 
     ###############################################################################################
+    def _nmf(self,
+             ntabs = 0
+             ):
+
+        self._nmf_wave_mask = self.rest_wavelength < 1750 * u.Angstrom
+
+        print("\t"*ntabs + f"Starting Non-negative Matrix Factorization on flux matrix with {self.fluxmat[:,self._nmf_wave_mask].shape[0]} objects and {self.fluxmat[:,self._nmf_wave_mask].shape[1]} wavelength bins.")
+        nit = 900
+        done = False
+        while not done:
+            nmfmod = NMF(n_components = self.mypars.nmf_ncomp, 
+                        init='random', 
+                        random_state=0, 
+                        max_iter=nit
+                        )
+            # _nmf_w will have shape (n_qso, n_comp)
+            self._nmf_W = nmfmod.fit_transform(self.fluxmat[:,self._nmf_wave_mask]/self.sdssfu) # Input needs shape (n_samples, n_features) = (n_qso, n_wavelength)
+            # _nmf_H will have shape (n_comp, n_wavelength)
+            self._nmf_H = nmfmod.components_
+            ncomp = nmfmod.n_components_
+            if nmfmod.n_iter_ < nit:
+                done = True
+            else:
+                nit *= 2
+                print("\t"*ntabs + f"Increasing number of iterations {nmfmod.n_iter_} --> {nit}")
+
+        print("\t"*ntabs + f"For reference: W.shape = {self._nmf_W.shape} H.shape = {self._nmf_H.shape}")
+
+        #plt.clf()
+        #self._nmf_pltcomp(wave_mask,
+        #                  ncomp//2,
+        #                  2
+        #                  )
+        #plt.show(block=False)
+        #plt.pause(0.1)
+
+        spdx = 9
+        plt.clf()
+        self._nmf_pltspec(spdx,
+                          ntabs = ntabs+1
+                          )
+        plt.show(block=False)
+        plt.pause(0.001)
+
+    ###############################################################################################
+    def _nmf_fitspec(self,
+                     spdx
+                     ):
+
+        return np.sum(self._nmf_H * (self._nmf_W.T[:,spdx])[:,None], 
+                      axis=0
+                      )
+    
+    ###############################################################################################
+    def _nmf_normspec(self,
+                      spdx,
+                      ntabs = 0
+                      ):
+        nmffit = self._nmf_fitspec(spdx)
+        normspec = self.fluxmat[spdx,self._nmf_wave_mask]/(nmffit * self.sdssfu)
+        normferr = 1/(np.sqrt(self.ivarmat[spdx,self._nmf_wave_mask]) * nmffit * self.sdssfu)
+
+        vwidth = const.c / self.mypars.R
+
+        wavelength = self.rest_wavelength[self._nmf_wave_mask]
+        dwave = np.zeros_like(wavelength)
+        dwave[1:-1] = 0.5 * (wavelength[2:] - wavelength[:-2])
+        dwave[ 0] = dwave[ 1]
+        dwave[-1] = dwave[-2]
+
+        for wsmooth in self.mypars.nmf_smooth_fac * (u.Angstrom):
+
+            ew, sew, EW, SEW = self.calcew(wavelength,
+                                           normspec,
+                                           normferr,
+                                           vwidth
+                                           )
+            ew_mask = EW < self.mypars.nmf_smooth_sigma * SEW
+            print("\t"*ntabs + f"Masking out {np.sum(EW >= self.mypars.nmf_smooth_sigma * SEW)} absorbed bins ({self.mypars.nmf_smooth_sigma}-sigma)")
+
+            kernel_width = np.int16(wsmooth / np.average(dwave))
+            print("\t"*ntabs + f"Creating box car kernel with width of {kernel_width} bins, where each bin is {np.average(dwave)}")
+            boxcar_kernel = Box1DKernel(width=kernel_width)
+            smoothed_flux = convolve(np.interp(wavelength, 
+                                            wavelength[ew_mask],
+                                            normspec[ew_mask]
+                                            ), 
+                                    boxcar_kernel,
+                                    boundary = 'extend'
+                                    )
+            normspec2 = normspec / (smoothed_flux + sys.float_info.epsilon)
+            normferr  = normferr / (smoothed_flux + sys.float_info.epsilon)
+
+            if np.any(np.isnan(normspec2)):
+                print("\t"*ntabs + f"{np.sum(np.isnan(normspec2))} bins with NaN fluxes")
+                print("\t"*ntabs + f"NaN fluxes at the following wavelengths: {wavelength[np.isnan(normspec2)]}")
+                print("\t"*ntabs + f"                 corresponding normspec: {normspec[np.isnan(normspec2)]}")
+                print("\t"*ntabs + f"            corresponding smoothed_flux: {smoothed_flux[np.isnan(normspec2)]}")
+                input("paused")
+
+            normspec = normspec2
+
+        return normspec, normferr
+
+    ###############################################################################################
+    def _nmf_pltcomp(self,
+                     nrow,
+                     ncol
+                     ):
+        ldx = self.rest_wavelength[self._nmf_wave_mask] < 1215 * u.Angstrom
+        hdx = self.rest_wavelength[self._nmf_wave_mask] > 1215 * u.Angstrom
+        for j in range(self._nmf_H.shape[0]):
+            y = self._nmf_H[j,:] * np.average(self._nmf_W[:,j])
+            #ylo = 0.95*np.min(np.extract((self.rest_wavelength > 1300 * u.Angstrom) & (y > 0), y))
+            #yhi = 1.05*np.max(np.extract((self.rest_wavelength > 1300 * u.Angstrom) & (y > 0), y))
+            plt.subplot(nrow,ncol,j+1)
+            plt.fill_between(self.rest_wavelength[self._nmf_wave_mask].value,
+                             self._nmf_H[j,:] * np.max(self._nmf_W[:,j]),
+                             self._nmf_H[j,:] * np.min(self._nmf_W[:,j]),
+                             alpha=0.5)
+            plt.step(self.rest_wavelength[self._nmf_wave_mask].value, 
+                     self._nmf_H[j,:] * np.average(self._nmf_W[:,j]), 
+                     "r", 
+                     label=f"W{j} * H{j}  {np.average(self._nmf_H[j,ldx])/np.average(self._nmf_H[j,hdx]):.3f}"
+                     )
+            #plt.ylim(ylo,yhi)
+#            if ylo <= 0: plt.ylim(bottom=np.min(np.extract(self.rest_wavelength > 1300, self.H[j,:] * np.average(self.W[:,j]))))
+#            plt.yscale("log")
+            plt.legend()
+
+    ###############################################################################################
+    def _nmf_pltspec(self,
+                     spdx,
+                     ntabs = 0
+                     ):
+
+        nmffit = self._nmf_fitspec(spdx)
+        nmflab = 'NMF: '
+        for w in self._nmf_W[spdx,:]:
+            nmflab += f" {w:.3f}"
+
+        normspec, normferr = self._nmf_normspec(spdx,
+                                                ntabs = ntabs
+                                                )
+
+
+        plt.subplot(211)
+        plt.step(self.rest_wavelength[self._nmf_wave_mask],
+                 self.fluxmat[spdx,self._nmf_wave_mask]/self.sdssfu,
+                 label = f"{spdx} SDSS spectrum"
+                 )
+        plt.step(self.rest_wavelength[self._nmf_wave_mask],
+                 nmffit,
+                 label = nmflab
+                 )
+        plt.step(self.rest_wavelength[self._nmf_wave_mask],
+                 self.fluxmat[spdx,self._nmf_wave_mask]/(normspec * self.sdssfu),
+                 label = "NMF + smoothing"
+                 )
+        plt.legend()
+
+        plt.subplot(212)
+        plt.step(self.rest_wavelength[self._nmf_wave_mask],
+                 normspec
+                 )
+        plt.plot(self.rest_wavelength[self._nmf_wave_mask],
+                 np.ones(self.rest_wavelength[self._nmf_wave_mask].size),
+                 "k--"
+                 )
+        plt.ylim([-0.2,1.4])
+
+    ###############################################################################################
     def _plot_dist(self):
         fig = plt.gcf()
         fig.clf()
@@ -667,18 +1187,35 @@ class sdsscat:
                             ntabs = 0
                             ):
 
+        try:
+            dum = self.fluxmat_sorted[0,0]
+        except:
+            self._generate_mock_sdss(ntabs = ntabs+1)
+
         random_sample = np.zeros_like(self.fluxmat)
 
-        #fig = plt.gcf()
-        for i in tqdm(range(self.fluxmat.shape[0]), ncols=0, desc="\t"*ntabs+f"Generating mock sample {idx}"):
-            random_sample[i,:] = self._generate_mock_sdss()
-            #fig.clf()
-            #axs = fig.add_subplot(1,1,1)
-            #axs.step(self.rest_wavelength,
-            #         random_sample[i,:]
-            #         )
-            #plt.show(block=False)
-            #plt.pause(0.1)
+        if self.mypars.nproc > 100:
+            pool_tuple_input = []
+            for i in range(self.fluxmat.shape[0]):
+                pool_tuple_input.append((ntabs+1,0))
+
+            with Pool() as pool, tqdm(range(self.fluxmat.shape[0]), ncols=0, desc="\t"*ntabs+f"Generating mock sample {idx}") as pbar:
+                pool_tuple_output = pool.starmap_async(self._generate_mock_sdss, 
+                                                       pool_tuple_input,
+                                                       chunksize=1
+                                                       )
+
+                nproc_left = self.fluxmat.shape[0]
+                while not pool_tuple_output.ready():
+                    if pool_tuple_output._number_left < nproc_left:
+                        pbar.update(nproc_left-pool_tuple_output._number_left)
+                        nproc_left = pool_tuple_output._number_left
+
+            for rzdx in range(self.fluxmat.shape[0]):
+                random_sample[rzdx,:] = pool_tuple_output.get()[rzdx]
+        else:
+            for i in tqdm(range(self.fluxmat.shape[0]), ncols=0, desc="\t"*ntabs+f"Generating mock sample {idx}"):
+                random_sample[i,:] = self._generate_mock_sdss()
 
         return random_sample
 
@@ -722,18 +1259,16 @@ class sdsscat:
     # The shape of self.fluxmat will be (number of quasars, number of wavelength bins)
     def _the_matrix(self,
                     speclist,
-                    ntabs = 0,
-                    plotspec = False
+                    ntabs = 0
                     ):
-        if plotspec:
-            fig = plt.gcf()
-            plt.ion()
-            fig.clf()
-            for ax in fig.get_axes():
-                ax.remove()
-            ax = fig.add_axes((0.125, 0.1, 0.775, 0.8))
-            ax.set_axis_on()
-            plt.ion()
+        fig = plt.gcf()
+        plt.ion()
+        fig.clf()
+        for ax in fig.get_axes():
+            ax.remove()
+        ax = fig.add_axes((0.125, 0.1, 0.775, 0.8))
+        ax.set_axis_on()
+        plt.ion()
 
         rest_wavelength = np.array([]) * u.Angstrom
         for spec in tqdm(speclist, ncols=0, desc="\t"*ntabs+"Entering The Matrix"):
@@ -800,7 +1335,7 @@ class sdsscat:
                     fluxmat[-1,-np.sum(append_mask):] = np.copy(spec.flux[append_mask])
                     ivarmat[-1,-np.sum(append_mask):] = np.copy(spec.ivar[append_mask])
 
-                if plotspec:
+                if fluxmat.shape[0] % self.mypars.plot_freq == 1:
                     ax.cla()
                     ax.step(rest_wavelength,
                             nqso)
@@ -821,6 +1356,39 @@ class sdsscat:
                     format="fits",
                     overwrite=True
                     )
+
+
+    ###############################################################################################
+    def calcew(self,
+               wavelength,
+               normflux,
+               normferr,
+               vwidth
+               ):
+
+        dwave = np.zeros_like(wavelength)
+        dwave[1:-1] = 0.5 * (wavelength[2:] - wavelength[:-2])
+        dwave[ 0] = dwave[ 1]
+        dwave[-1] = dwave[-2]
+
+        dvel = const.c * dwave / wavelength
+        kernel_width = np.int16((vwidth/np.average(dvel)).decompose() / 2.303)
+        gauss_1D_kernel = Gaussian1DKernel(kernel_width)
+
+        ew  = (1.0 - normflux) * dwave
+        sew =        normferr  * dwave
+
+        bigew = convolve(ew, 
+                         gauss_1D_kernel,
+                         boundary='extend'
+                         )
+        bigsew = convolve(sew, 
+                          gauss_1D_kernel, 
+                          boundary='extend'
+                          )
+
+        return ew,sew,bigew,bigsew
+
 
 """
             self.qnum     = np.array([], dtype=np.int32)
@@ -1073,26 +1641,6 @@ class sdsscat:
                 newobjfilt[np.extract(np.fabs(self.W[:,j] - meanW[j]) > sigclip * stdW[j], range(nobj))] = 0
             self.objfilt = np.copy(newobjfilt)
 
-
-    def pltcomp(self,nrow,ncol):
-        plt.clf()
-        ldx = np.extract(self.wavebins < 1215, range(self.wavebins.size))
-        hdx = np.extract(self.wavebins > 1215, range(self.wavebins.size))
-        for j in range(self.H[:,0].size):
-            y = self.H[j,:] * np.average(self.W[:,j])
-            ylo = 0.95*np.min(np.extract((self.wavebins > 1300) & (y > 0), y))
-            yhi = 1.05*np.max(np.extract((self.wavebins > 1300) & (y > 0), y))
-            plt.subplot(nrow,ncol,j+1)
-            plt.fill_between(self.wavebins,
-                             self.H[j,:] * np.max(self.W[:,j]),
-                             self.H[j,:] * np.min(self.W[:,j]),
-                             alpha=0.5)
-            plt.step(self.wavebins, self.H[j,:] * np.average(self.W[:,j]), "r", label=f"W{j} * H{j}  {np.average(self.H[j,ldx])/np.average(self.H[j,hdx]):.3f}")
-            plt.ylim(ylo,yhi)
-#            if ylo <= 0: plt.ylim(bottom=np.min(np.extract(self.wavebins > 1300, self.H[j,:] * np.average(self.W[:,j]))))
-            plt.yscale("log")
-            plt.legend()
-        plt.pause(0.1)
 
     def calcspec(self,W):
         return np.dot(np.transpose(self.H), W)

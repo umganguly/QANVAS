@@ -1,65 +1,8 @@
 import os
 import numpy             as np
 
-from astropy.io            import ascii
-from doppler               import calcvel
-from doppler               import calcwave
 from astropy               import units as u
-from astropy.modeling.functional_models import Voigt1D
-
-
-# The atomic class defines the database of atomic transitions from Verner, Barthel, & Tytler and Morton.
-######################################################
-# User inputs for __init__ to define the class:
-#        self.basedir = string location of database
-#        wlo          = Lowest  wavelength for the spectrum (Angstroms)
-#        whi          = Highest wavelength for the spectrum (Angstroms)
-#        minlox       = Minimum Line Observability Index (Hellsten et al) to keep transitions
-#
-######################################################
-# __init__ sets the following:
-#        self.species = Species name (no spaces)
-#        self.wave    = Transition wavelength (Angstroms)
-#        self.f       = Transition oscillator strength
-#        self.gamma   = Transition natural broadening parameter
-#        self.ip      = Ion ionization potential
-#        self.anum    = Atomic number
-#        self.ion     = Ion stange (1=neutral, 2=singly ionized, etc.)
-#        self.abund   = Elemental abundance (12 + [X/H]) from Asplund et al.
-#        self.amass   = Atomic mass (u)
-#        self.lox     = Line Observability Index = self.abund + np.log10(self.f*self.wave + 1.0e-30)
-#        self.nion    = Number of unique ions in database
-#        self.idx     = Index of the first occurence of each unique ion in the database (coresponding to the strongest transition)
-#        self.specstr = Species name (w/ spaces)
-#        self.flam    = self.f * self.wave
-#
-###############################################################################################
-#    def getspecies:
-#        Input: anum = Atomic Number
-#               ion  = Ion stage
-#        Return: array of indices corresponding to all transition of that anum and ion
-#
-###############################################################################################
-#    def atomstr:
-#        Input: anum = Atomic Number
-#        Return: String of the element period table symbol
-#
-###############################################################################################
-#    def ionstr
-#        Input: inum = Ion stage
-#        Return: String with ocrresponding Roman numberal (for spectroscopist notation)
-#
-###############################################################################################
-#    def tauion:
-#        Input wave = wavelength array (Angstroms)
-#              anum = Atomic number
-#              ion  = Ion stage
-#              tau0 = Opitcal depths at line center
-#              b    = b-parameters (typcally thermal broadening, km/s)
-#              v    = cloud velocities (km/s)
-#        Return: line optical depth array of shape (wave.size,nabs) where nabs is the number of clouds
-#
-###############################################################################################
+from astropy.table         import Table
 
 class atomic:
     ###############################################################################################
@@ -72,7 +15,7 @@ class atomic:
         datfile = "atoms4.dat"
         self.minlox = minlox
         if (os.path.exists(basedir+"/"+datfile)):
-            data = ascii.read(basedir+"/"+datfile,format='no_header')
+            data = Table.read(basedir+"/"+datfile,format='ascii')
             self.species = np.copy(data['col1'])
             self.wave    = np.copy(data['col2']) * u.Angstrom
             self.f       = np.copy(data['col3'])
@@ -124,7 +67,7 @@ class atomic:
 
         datfile = "photo.dat"
         if (os.path.exists(basedir+"/"+datfile)):
-          data = ascii.read(basedir+"/"+datfile,format='no_header')
+          data = Table.read(basedir+"/"+datfile,format='ascii')
           self.photo_Z     = data['col1']
           self.photo_N     = data['col2']
           self.photo_E_th  = data['col3'] * u.eV
