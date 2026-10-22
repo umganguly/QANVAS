@@ -1,7 +1,5 @@
 #import os
 #import numpy as np
-import matplotlib.pyplot
-matplotlib.use('TkAgg')
 #import matplotlib.pyplot as plt
 #import scipy as sp
 import sys
@@ -33,7 +31,7 @@ from readpars              import readpars
 ####################################################################
 breakstr = "#" * 50
 
-inputfile = "Qanvaspar.txt"
+inputfile = "qanvaspar.txt"
 
 if len(sys.argv) > 1:
     inputfile = sys.argv[1]
