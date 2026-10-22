@@ -52,7 +52,7 @@ class readpars:
 #docluster  = True
 #if (((f.readline()).split())[0] == 'False'): docluster = False
         ###########################################################################
-        # Data directory
+
          print("Defining program parameters")
          try:
             print(f"Base data path = {self.basedir}")
@@ -60,8 +60,6 @@ class readpars:
             print(f"Base data path not defined in {inputfile}")
             self.basedir = "/mnt/data/QANVAS_data"
 
-        ###########################################################################
-        # Program flow
          try:
             print(f"Verbose = {self.verbose}")
          except AttributeError:
@@ -69,126 +67,7 @@ class readpars:
             self.verbose = True
 
          try:
-            print(f"ned_photometry = {self.ned_photometry}")
-         except AttributeError:
-            print(f"ned_photometry not defined in {inputfile}")
-            self.ned_photometry = True
-
-         try:
-            print(f"sdss_composite = {self.sdss_composite}")
-         except AttributeError:
-            print(f"sdss_composite not defined in {inputfile}")
-            self.sdss_composite = True
-
-         try:
-            print(f"plot_freq = {self.splot_freq}")
-         except AttributeError:
-            print(f"plot_freq not defined in {inputfile}")
-            self.plot_freq = 100
-
-         try:
-            print(f"nproc = {self.nproc}")
-         except AttributeError:
-            print(f"nproc not defined in {inputfile}")
-            self.nproc = 1
-
-        ###########################################################################
-        # Sample parameters
-         try:
             print(f"Nsamp = {self.nsamp}")
          except AttributeError:
             print(f"Nsamp not defined in {inputfile}")
             self.nsamp = -1
-
-         try:
-            print(f"snr1300min = {self.snr1300min}")
-         except AttributeError:
-            print(f"snr1300min not defined in {inputfile}")
-            self.snr1300min = -1
-
-         try:
-            print(f"object_filter = {self.object_filter}")
-         except AttributeError:
-            print(f"object_filter not defined in {inputfile}")
-            self.object_filter = np.array([])
-
-         try:
-            print(f"R = {self.R}")
-         except AttributeError:
-            print(f"R not defined in {inputfile}")
-            self.R = 1300.
-
-
-        ###########################################################################
-        # Clustering parameters
-         try:
-            print(f"clustering = {self.clustering}")
-         except AttributeError:
-            print(f"clustering not defined in {inputfile}")
-            self.clustering = False
-
-         try:
-            print(f"cluster_nsigma = {self.cluster_nsigma}")
-         except AttributeError:
-            print(f"cluster_nsigma not defined in {inputfile}")
-            self.cluster_nsigma = 3.0
-
-         try:
-            print(f"cluster_tol = {self.cluster_tol}")
-         except AttributeError:
-            print(f"cluster_tol not defined in {inputfile}")
-            self.cluster_tol = 1.0e-5
-
-        ###########################################################################
-        # NMF parameters
-         try:
-            print(f"nmf = {self.nmf}")
-         except AttributeError:
-            print(f"nmf not defined in {inputfile}")
-            self.nmf = False
-
-         try:
-            print(f"nmf_ncomp = {self.nmf_ncomp}")
-         except AttributeError:
-            print(f"nmf_ncomp not defined in {inputfile}")
-            self.nmf_ncomp = 10
-
-         try:
-            print(f"nmf_smooth_fac = {self.nmf_smooth_fac}")
-         except AttributeError:
-            print(f"nmf_smooth_fac not defined in {inputfile}")
-            self.nmf_smooth_fac = np.array([24,12])
-
-         try:
-            print(f"nmf_smooth_sigma = {self.nmf_smooth_sigma}")
-         except AttributeError:
-            print(f"nmf_smooth_sigma not defined in {inputfile}")
-            self.nmf_smooth_sigma = 1.0
-
-        ###########################################################################
-        # Absorption Catalog parameters
-         try:
-            print(f"abscat = {self.abscat}")
-         except AttributeError:
-            print(f"abscat not defined in {inputfile}")
-            self.abscat = False
-
-         try:
-            print(f"lohiip = {self.lohiip}")
-         except AttributeError:
-            print(f"lohiip not defined in {inputfile}")
-            self.lohiip = np.array([20.0])
-
-         try:
-            self.abs_vlo *= (u.km/u.s)
-            print(f"abs_vlo = {self.abs_vlo}")
-         except AttributeError:
-            print(f"abs_vlo not defined in {inputfile}")
-            self.abs_vlo = -25000 * (u.km/u.s)
-
-         try:
-            self.abs_vhi *= (u.km/u.s)
-            print(f"abs_vhi = {self.abs_vhi}")
-         except AttributeError:
-            print(f"abs_vhi not defined in {inputfile}")
-            self.abs_vhi = 5000 * (u.km/u.s)
