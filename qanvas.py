@@ -43,6 +43,8 @@ print(breakstr)
 print("Prepare to QANVAS Cosmic Noon!")
 print(breakstr)
 ####################################################################
+print("My name is George")
+
 mypars = readpars(inputfile)
 # Parameters and Program Flow
 
