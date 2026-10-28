@@ -43,7 +43,7 @@ print(breakstr)
 ####################################################################
 mypars = readpars(inputfile)
 # Parameters and Program Flow
-
+print ("my name is Bob")
 
 if mypars.verbose:
     print('---------------------------------------')
