@@ -1,5 +1,7 @@
 #import os
 #import numpy as np
+import matplotlib.pyplot
+matplotlib.use('TkAgg')
 #import matplotlib.pyplot as plt
 #import scipy as sp
 import sys
@@ -31,7 +33,7 @@ from readpars              import readpars
 ####################################################################
 breakstr = "#" * 50
 
-inputfile = "qanvaspar.txt"
+inputfile = "Qanvaspar.txt"
 
 if len(sys.argv) > 1:
     inputfile = sys.argv[1]
@@ -41,6 +43,8 @@ print(breakstr)
 print("Prepare to QANVAS Cosmic Noon!")
 print(breakstr)
 ####################################################################
+print("My name is George")
+
 mypars = readpars(inputfile)
 # Parameters and Program Flow
 
